@@ -56,6 +56,7 @@ enum ConstEventType: int
     case INTVAR_EVENT = 5;
     case MARIA_UPDATE_ROWS_COMPRESSED_EVENT = 170;
     case MARIA_GTID_EVENT = 162;
+    case TRANSACTION_PAYLOAD_EVENT = 39;
 
     //Transaction ID for 2PC, written whenever a COMMIT is expected.
 
