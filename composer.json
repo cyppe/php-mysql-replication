@@ -46,6 +46,11 @@
       "MySQLReplication\\Tests\\": "tests/"
     }
   },
+  "extra": {
+    "branch-alias": {
+      "dev-fix/transaction-payload-event-type": "9.0.x-dev"
+    }
+  },
   "minimum-stability": "stable",
   "config": {
     "sort-packages": true
