@@ -16,6 +16,8 @@ class RowEventBuilder
 {
     private BinaryDataReader $binaryDataReader;
     private EventInfo $eventInfo;
+    private readonly TableMapCache $tableMapCache;
+    private readonly TableMapBuilder $tableMapBuilder;
 
     public function __construct(
         private readonly RepositoryInterface $repository,
@@ -24,6 +26,8 @@ class RowEventBuilder
         private readonly BinLogServerInfo $binLogServerInfo,
         private readonly LoggerInterface $logger
     ) {
+        $this->tableMapCache = new TableMapCache($cache);
+        $this->tableMapBuilder = new TableMapBuilder($repository, $config, $logger);
     }
 
     public function withBinaryDataReader(BinaryDataReader $binaryDataReader): void
@@ -34,13 +38,15 @@ class RowEventBuilder
     public function build(): RowEvent
     {
         return new RowEvent(
-            $this->repository,
             $this->binaryDataReader,
             $this->eventInfo,
-            new TableMapCache($this->cache),
+            $this->repository,
+            $this->cache,
             $this->config,
             $this->binLogServerInfo,
-            $this->logger
+            $this->logger,
+            $this->tableMapCache,
+            $this->tableMapBuilder
         );
     }
 

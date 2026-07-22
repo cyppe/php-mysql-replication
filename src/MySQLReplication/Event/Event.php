@@ -36,7 +36,8 @@ readonly class Event
         private EventDispatcherInterface $eventDispatcher,
         private CacheInterface $cache,
         private Config $config,
-        private BinLogServerInfo $binLogServerInfo
+        private BinLogServerInfo $binLogServerInfo,
+        private ?EventObserverInterface $eventObserver = null
     ) {
     }
 
@@ -71,18 +72,19 @@ readonly class Event
             }
         }
 
-        $this->dispatch($this->makeEvent($binaryDataReader));
+        $eventInfo = $this->createEventInfo($binaryDataReader);
+        $eventDTO = $this->makeEvent($binaryDataReader, $eventInfo);
+        $dispatched = $this->dispatch($eventDTO);
+
+        $this->eventObserver?->onEventProcessed($eventInfo, $eventDTO, $dispatched);
 
         if ($semiSyncAckRequired) {
             $this->binLogSocketConnect->sendSemiSyncAck();
         }
     }
 
-    private function makeEvent(BinaryDataReader $binaryDataReader): ?EventDTO
+    private function makeEvent(BinaryDataReader $binaryDataReader, EventInfo $eventInfo): ?EventDTO
     {
-        // decode all events data
-        $eventInfo = $this->createEventInfo($binaryDataReader);
-
         // we always need these events to clean table maps and for BinLogCurrent class to keep track of binlog position
         // always parse table map event but propagate when needed (we need this for creating table cache)
         if ($eventInfo->type === ConstEventType::TABLE_MAP_EVENT->value) {
@@ -132,7 +134,9 @@ readonly class Event
         }
 
         if ($eventInfo->type === ConstEventType::QUERY_EVENT->value) {
-            return $this->filterDummyMariaDbEvents((new QueryEvent($eventInfo, $binaryDataReader, $this->binLogServerInfo))->makeQueryDTO());
+            return $this->filterDummyMariaDbEvents(
+                (new QueryEvent($eventInfo, $binaryDataReader, $this->binLogServerInfo))->makeQueryDTO()
+            );
         }
 
         // The Rows Query Log Event will be triggered with enabled MySQL Config `binlog_rows_query_log_events`
@@ -173,14 +177,15 @@ readonly class Event
         return $queryDTO;
     }
 
-    private function dispatch(?EventDTO $eventDTO): void
+    private function dispatch(?EventDTO $eventDTO): bool
     {
-        if ($eventDTO !== null) {
-            if ($this->ignoreEvent($eventDTO->getEventInfo()->type)) {
-                return;
-            }
-            $this->eventDispatcher->dispatch($eventDTO, $eventDTO->getType());
+        if ($eventDTO === null || $this->ignoreEvent($eventDTO->getEventInfo()->type)) {
+            return false;
         }
+
+        $this->eventDispatcher->dispatch($eventDTO, $eventDTO->getType());
+
+        return true;
     }
 
     private function ignoreEvent(int $type): bool

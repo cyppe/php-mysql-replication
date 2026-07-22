@@ -21,6 +21,7 @@ use MySQLReplication\Exception\MySQLReplicationException;
 use MySQLReplication\JsonBinaryDecoder\JsonBinaryDecoderService;
 use MySQLReplication\Repository\RepositoryInterface;
 use Psr\Log\LoggerInterface;
+use Psr\SimpleCache\CacheInterface;
 use RuntimeException;
 
 class RowEvent extends EventCommon
@@ -291,20 +292,25 @@ class RowEvent extends EventCommon
 
     private ?TableMap $currentTableMap;
 
+    private readonly TableMapCache $tableMapCache;
+
     private readonly TableMapBuilder $tableMapBuilder;
 
     public function __construct(
-        RepositoryInterface $repository,
         protected BinaryDataReader $binaryDataReader,
         protected EventInfo $eventInfo,
-        private readonly TableMapCache $tableMapCache,
+        RepositoryInterface $repository,
+        CacheInterface $cache,
         private readonly Config $config,
         protected BinLogServerInfo $binLogServerInfo,
-        private readonly LoggerInterface $logger
+        private readonly LoggerInterface $logger,
+        ?TableMapCache $tableMapCache = null,
+        ?TableMapBuilder $tableMapBuilder = null
     ) {
-        parent::__construct($eventInfo, $binaryDataReader, $binLogServerInfo);
+        $this->tableMapCache = $tableMapCache ?? new TableMapCache($cache);
+        $this->tableMapBuilder = $tableMapBuilder ?? new TableMapBuilder($repository, $config, $logger);
 
-        $this->tableMapBuilder = new TableMapBuilder($repository, $config, $logger);
+        parent::__construct($eventInfo, $binaryDataReader, $binLogServerInfo);
     }
 
     /**

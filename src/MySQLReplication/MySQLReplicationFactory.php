@@ -12,6 +12,7 @@ use MySQLReplication\BinLog\BinLogSocketConnect;
 use MySQLReplication\Cache\ArrayCache;
 use MySQLReplication\Config\Config;
 use MySQLReplication\Event\Event;
+use MySQLReplication\Event\EventObserverInterface;
 use MySQLReplication\Event\RowEvent\RowEventBuilder;
 use MySQLReplication\Event\RowEvent\RowEventFactory;
 use MySQLReplication\Repository\MySQLRepository;
@@ -38,7 +39,8 @@ class MySQLReplicationFactory
         ?CacheInterface $cache = null,
         ?EventDispatcherInterface $eventDispatcher = null,
         ?SocketInterface $socket = null,
-        ?LoggerInterface $logger = null
+        ?LoggerInterface $logger = null,
+        ?EventObserverInterface $eventObserver = null
     ) {
         $logger = $logger ?? new NullLogger();
         $logger->debug('Current config', $config->toArray());
@@ -76,7 +78,8 @@ class MySQLReplicationFactory
             $this->eventDispatcher,
             $cache,
             $config,
-            $this->binLogSocketConnect->getBinLogServerInfo()
+            $this->binLogSocketConnect->getBinLogServerInfo(),
+            $eventObserver
         );
     }
 

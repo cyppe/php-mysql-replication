@@ -82,6 +82,17 @@ class EventInfoTest extends TestCase
         $decoded = json_decode($json, true);
         self::assertArrayHasKey('timestamp', $decoded);
         self::assertArrayHasKey('type', $decoded);
+        self::assertSame('QUERY_EVENT', $decoded['typeName']);
+    }
+
+    public function testShouldResolveTypeNameLazily(): void
+    {
+        $eventInfo = $this->makeEventInfo(type: ConstEventType::QUERY_EVENT->value);
+        $property = new \ReflectionProperty(EventInfo::class, 'typeName');
+
+        self::assertNull($property->getValue($eventInfo));
+        self::assertSame('QUERY_EVENT', $eventInfo->getTypeName());
+        self::assertSame('QUERY_EVENT', $property->getValue($eventInfo));
     }
     private function makeEventInfo(
         int $timestamp = 1620000000,

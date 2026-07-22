@@ -28,12 +28,12 @@ class EventInfo implements JsonSerializable
             $this->binLogCurrent->setBinLogPosition($pos);
         }
         $this->sizeNoHeader = $this->dateTime = null;
-        $this->typeName = ConstEventType::tryFrom($this->type)?->name;
+        $this->typeName = null;
     }
 
     public function getTypeName(): ?string
     {
-        return $this->typeName;
+        return $this->typeName ??= ConstEventType::tryFrom($this->type)?->name;
     }
 
     public function getDateTime(): ?string
@@ -60,6 +60,8 @@ class EventInfo implements JsonSerializable
 
     public function jsonSerialize(): array
     {
+        $this->getTypeName();
+
         return get_object_vars($this);
     }
 }

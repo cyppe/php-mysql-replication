@@ -104,6 +104,22 @@ class TableMapBuilderTest extends TestCase
         self::assertSame('amount_from_schema', $columns->offsetGet(1)->getName());
     }
 
+    public function testShouldFallBackToRepositoryWhenMetadataHasOnlySomeColumnNames(): void
+    {
+        $this->repository->expects(self::once())
+            ->method('getFields')
+            ->with('test_db', 'test_table')
+            ->willReturn($this->makeFieldDTOCollection());
+
+        $builder = $this->makeBuilder((new ConfigBuilder())->build());
+        $reader = new BinaryDataReader($this->nullBitmap(2) . $this->makePartialMetadataBlob());
+
+        $tableMap = $builder->build($reader, $this->makeEventInfo(), 'test_db', 'test_table', '1', 2, $this->columnTypes());
+
+        self::assertSame('id_from_schema', $tableMap->columnDTOCollection->offsetGet(0)->getName());
+        self::assertSame('amount_from_schema', $tableMap->columnDTOCollection->offsetGet(1)->getName());
+    }
+
     public function testShouldGuardAgainstColumnDroppedAfterBinlogWasWritten(): void
     {
         $this->repository->expects(self::once())->method('getFields')->willReturn(
@@ -205,6 +221,13 @@ class TableMapBuilderTest extends TestCase
 
         // binlog_row_metadata=MINIMAL only ever writes signedness, no COLUMN_NAME field
         return $field(ConstTableMapMetadataFieldType::SIGNEDNESS, chr(0b01000000));
+    }
+
+    private function makePartialMetadataBlob(): string
+    {
+        $columnName = chr(2) . 'id';
+
+        return chr(ConstTableMapMetadataFieldType::COLUMN_NAME) . chr(strlen($columnName)) . $columnName;
     }
 
     private function makeEventInfo(): EventInfo
