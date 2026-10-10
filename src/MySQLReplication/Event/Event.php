@@ -55,7 +55,7 @@ readonly class Event
             return;
         }
 
-        $binaryDataReader = new BinaryDataReader($rawResponse);
+        $binaryDataReader = new BinaryDataReader($rawResponse, failOnReadPastEnd: true);
 
         // check EOF_Packet -> https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_eof_packet.html
         if ($binaryDataReader->readUInt8() === self::EOF_HEADER_VALUE) {

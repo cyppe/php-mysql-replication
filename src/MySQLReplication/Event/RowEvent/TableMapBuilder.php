@@ -62,6 +62,14 @@ readonly class TableMapBuilder
         } else {
             $this->logger->debug('Resolving column metadata for ' . $schemaName . '.' . $tableName . ' from information_schema');
             $fieldDTOCollection = $this->repository->getFields($schemaName, $tableName);
+            if (!$fieldDTOCollection->isEmpty() && $fieldDTOCollection->count() !== $columnsAmount) {
+                $this->logger->warning(
+                    'information_schema lists ' . $fieldDTOCollection->count() . ' columns for ' . $schemaName . '.' . $tableName
+                    . ' but the TABLE_MAP_EVENT (table_id ' . $tableId . ') has ' . $columnsAmount
+                    . '; the table changed after this event was written, so column names may be misattributed.'
+                    . ' Use binlog_row_metadata=FULL with useTableMapMetadata to decode by the event\'s own names.'
+                );
+            }
         }
 
         $columnDTOCollection = $this->makeColumnDTOCollection($rawColumnDTOs, $fieldDTOCollection);
@@ -185,16 +193,16 @@ readonly class TableMapBuilder
         }
 
         foreach ($rawColumnDTOs as $offset => $rawColumnDTO) {
-            // this a dirty hack to prevent row events containing columns which have been dropped
-            // (only reachable via the information_schema fallback; the binlog metadata path is
-            // self-describing and always covers every column written into this very event)
-            if ($fieldDTOCollection->offsetExists($offset)) {
-                $fieldDTO = $fieldDTOCollection->offsetGet($offset);
-                $type = $rawColumnDTO->type;
-            } else {
-                $fieldDTO = FieldDTO::makeDummy($offset);
-                $type = ConstFieldType::IGNORE;
-            }
+            // a column written into this event but no longer in information_schema (dropped after
+            // the event was written; only reachable via the information_schema fallback, the binlog
+            // metadata path is self-describing) gets a placeholder name but is still decoded by its
+            // real binlog type: the type and its storage metadata always come from the event, and
+            // skipping it as IGNORE (0 bytes for fixed-width types) desynchronised every later
+            // value, e.g. a wrong primary key after dropping the last column
+            $fieldDTO = $fieldDTOCollection->offsetExists($offset)
+                ? $fieldDTOCollection->offsetGet($offset)
+                : FieldDTO::makeDummy($offset);
+            $type = $rawColumnDTO->type;
 
             if ($fieldDTO !== null) {
                 $columnDTOCollection->set(

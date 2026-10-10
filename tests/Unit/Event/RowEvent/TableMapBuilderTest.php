@@ -145,7 +145,24 @@ class TableMapBuilderTest extends TestCase
         $columns = $tableMap->columnDTOCollection;
         self::assertSame('id_from_schema', $columns->offsetGet(0)->getName());
         self::assertSame('DROPPED_COLUMN_1', $columns->offsetGet(1)->getName());
-        self::assertSame(ConstFieldType::IGNORE, $columns->offsetGet(1)->type);
+        // still decoded by the type the event declares, so later values stay aligned
+        self::assertSame(ConstFieldType::LONG, $columns->offsetGet(1)->type);
+    }
+
+    public function testSchemaDriftBetweenEventAndInformationSchemaIsLoggedAsAWarning(): void
+    {
+        $this->repository->method('getFields')->willReturn(
+            FieldDTOCollection::makeFromArray([
+                ['COLUMN_NAME' => 'id', 'COLLATION_NAME' => null, 'CHARACTER_SET_NAME' => null, 'COLUMN_COMMENT' => '', 'COLUMN_TYPE' => 'int', 'COLUMN_KEY' => 'PRI'],
+            ])
+        );
+        $logger = $this->createMock(\Psr\Log\LoggerInterface::class);
+        $logger->expects(self::once())
+            ->method('warning')
+            ->with(self::stringContains('information_schema lists 1 columns for test_db.test_table but the TABLE_MAP_EVENT (table_id 1) has 2'));
+
+        $builder = new TableMapBuilder($this->repository, (new ConfigBuilder())->withUseTableMapMetadata(false)->build(), $logger);
+        $builder->build(new BinaryDataReader($this->nullBitmap(2)), $this->makeEventInfo(), 'test_db', 'test_table', '1', 2, $this->columnTypes());
     }
 
     public function testShouldReturnEmptyColumnsWhenTableWasDropped(): void

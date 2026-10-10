@@ -44,9 +44,20 @@ class BinaryDataReader
 
     private bool $hasPushback = false;
 
+    private readonly int $binaryDataLength;
+
+    /**
+     * @param bool $failOnReadPastEnd throw instead of returning a short string when a read runs past
+     *                                the data; on for whole-event readers, where an over-read always
+     *                                means the decoder lost its place (e.g. column metadata that does
+     *                                not match the row image). Off by default because nested readers
+     *                                (JSON documents, metadata fields) rely on lenient trailing reads.
+     */
     public function __construct(
-        private readonly string $binaryData
+        private readonly string $binaryData,
+        private readonly bool $failOnReadPastEnd = false
     ) {
+        $this->binaryDataLength = strlen($binaryData);
     }
 
     public static function pack64bit(int $value): string
@@ -86,6 +97,9 @@ class BinaryDataReader
         if (!$this->hasPushback) {
             $offset = $this->offset;
             $this->offset = $offset + $length;
+            if ($this->failOnReadPastEnd && $this->offset > $this->binaryDataLength) {
+                throw BinaryDataReaderException::readPastEnd($length, $this->binaryDataLength - $offset);
+            }
 
             // Single-byte reads (readUInt8/readInt8/marker peeks/bitmap bytes) dominate call
             // volume — direct offset access skips the substr() call entirely for that case.
@@ -102,6 +116,9 @@ class BinaryDataReader
         }
 
         $fromBinary = $length - $pushbackLength;
+        if ($this->failOnReadPastEnd && $this->offset + $fromBinary > $this->binaryDataLength) {
+            throw BinaryDataReaderException::readPastEnd($length, $pushbackLength + $this->binaryDataLength - $this->offset);
+        }
         $result = $this->pushback . substr($this->binaryData, $this->offset, $fromBinary);
         $this->pushback = '';
         $this->hasPushback = false;

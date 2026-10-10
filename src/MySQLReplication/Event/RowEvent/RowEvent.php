@@ -7,6 +7,7 @@ namespace MySQLReplication\Event\RowEvent;
 use DateTime;
 use Exception;
 use MySQLReplication\BinaryDataReader\BinaryDataReader;
+use MySQLReplication\BinaryDataReader\BinaryDataReaderException;
 use MySQLReplication\BinLog\BinLogServerInfo;
 use MySQLReplication\Config\Config;
 use MySQLReplication\Definitions\ConstEventType;
@@ -389,24 +390,35 @@ class RowEvent extends EventCommon
 
     public function makeUpdateRowsDTO(): ?UpdateRowsDTO
     {
-        $this->currentTableMap = $this->findTableMap();
-        if ($this->currentTableMap === null) {
+        $tableMap = $this->currentTableMap = $this->findTableMap();
+        if ($tableMap === null) {
             return null;
         }
 
-        $columnsBinarySize = $this->getColumnsBinarySize($this->currentTableMap->columnsAmount);
+        // same guard as getValues(): without columns we cannot decode the row images
+        if ($tableMap->columnDTOCollection->isEmpty()) {
+            return new UpdateRowsDTO($this->eventInfo, $tableMap, 0, []);
+        }
+
+        $columnsBinarySize = $this->getColumnsBinarySize($tableMap->columnsAmount);
         $beforeBinaryData = $this->binaryDataReader->read($columnsBinarySize);
         $afterBinaryData = $this->binaryDataReader->read($columnsBinarySize);
 
+        $trailerLength = $this->getTrailerLength();
         $values = [];
-        while (!$this->binaryDataReader->isComplete($this->eventInfo->getSizeNoHeader())) {
-            $values[] = [
-                'before' => $this->getColumnData($beforeBinaryData),
-                'after' => $this->getColumnData($afterBinaryData),
-            ];
+        try {
+            while ($this->binaryDataReader->getBinaryDataLength() > $trailerLength) {
+                $values[] = [
+                    'before' => $this->getColumnData($beforeBinaryData),
+                    'after' => $this->getColumnData($afterBinaryData),
+                ];
+            }
+        } catch (BinaryDataReaderException $exception) {
+            throw RowEventDesyncException::make($tableMap, $this->eventInfo, -1, $exception);
         }
+        $this->assertRowsEndAtEventBoundary($trailerLength);
 
-        return new UpdateRowsDTO($this->eventInfo, $this->currentTableMap, count($values), $values);
+        return new UpdateRowsDTO($this->eventInfo, $tableMap, count($values), $values);
     }
 
     protected function findTableMap(): ?TableMap
@@ -445,18 +457,47 @@ class RowEvent extends EventCommon
     protected function getValues(): array
     {
         // if we don't get columns from information schema we don't know how to assign them
-        if ($this->currentTableMap === null || $this->currentTableMap->columnDTOCollection->isEmpty()) {
+        $tableMap = $this->currentTableMap;
+        if ($tableMap === null || $tableMap->columnDTOCollection->isEmpty()) {
             return [];
         }
 
-        $binaryData = $this->binaryDataReader->read($this->getColumnsBinarySize($this->currentTableMap->columnsAmount));
+        $binaryData = $this->binaryDataReader->read($this->getColumnsBinarySize($tableMap->columnsAmount));
 
+        $trailerLength = $this->getTrailerLength();
         $values = [];
-        while (!$this->binaryDataReader->isComplete($this->eventInfo->getSizeNoHeader())) {
-            $values[] = $this->getColumnData($binaryData);
+        try {
+            while ($this->binaryDataReader->getBinaryDataLength() > $trailerLength) {
+                $values[] = $this->getColumnData($binaryData);
+            }
+        } catch (BinaryDataReaderException $exception) {
+            throw RowEventDesyncException::make($tableMap, $this->eventInfo, -1, $exception);
         }
+        $this->assertRowsEndAtEventBoundary($trailerLength);
 
         return $values;
+    }
+
+    /**
+     * Rows run to the end of the packet minus the trailing checksum. Measuring the bytes left in
+     * the packet (instead of bytes read against the header's event size) stays correct when a
+     * semi-sync prefix precedes the event header.
+     */
+    protected function getTrailerLength(): int
+    {
+        return $this->eventInfo->checkSum ? 4 : 0;
+    }
+
+    /**
+     * A correct decode consumes the row images exactly. Ending anywhere else means the column
+     * metadata does not describe the written rows, and every value (keys included) is suspect.
+     */
+    protected function assertRowsEndAtEventBoundary(int $trailerLength): void
+    {
+        $unreadBytes = $this->binaryDataReader->getBinaryDataLength() - $trailerLength;
+        if ($unreadBytes !== 0 && $this->currentTableMap !== null) {
+            throw RowEventDesyncException::make($this->currentTableMap, $this->eventInfo, $unreadBytes);
+        }
     }
 
     protected function getColumnsBinarySize(int $columnsAmount): int

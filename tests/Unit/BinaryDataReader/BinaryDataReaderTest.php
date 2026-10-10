@@ -236,4 +236,33 @@ class BinaryDataReaderTest extends TestCase
     {
         self::assertSame(-1.5, $this->getBinaryRead("\x00\x00\x00\x00\x00\x00\xF8\xBF")->readDouble());
     }
+
+    public function testReadPastTheEndIsLenientByDefault(): void
+    {
+        $reader = new BinaryDataReader('ab');
+
+        self::assertSame('ab', $reader->read(3));
+    }
+
+    public function testReadPastTheEndFailsWhenStrict(): void
+    {
+        $reader = new BinaryDataReader('abc', failOnReadPastEnd: true);
+        self::assertSame('ab', $reader->read(2));
+
+        $this->expectException(BinaryDataReaderException::class);
+        $this->expectExceptionCode(BinaryDataReaderException::READ_PAST_END_CODE);
+        $reader->read(2);
+    }
+
+    public function testReadPastTheEndAfterAnUnreadFailsWhenStrict(): void
+    {
+        $reader = new BinaryDataReader('abc', failOnReadPastEnd: true);
+        $reader->read(3);
+        $reader->unread('c');
+        self::assertSame('c', $reader->read(1));
+        $reader->unread('c');
+
+        $this->expectException(BinaryDataReaderException::class);
+        $reader->read(2);
+    }
 }

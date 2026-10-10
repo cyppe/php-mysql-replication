@@ -105,6 +105,40 @@ class BasicTest extends BaseCase
         self::assertSame([['id' => 2, 'data' => 'There']], $event->values);
     }
 
+    /**
+     * Without FULL metadata, rows written before a DROP COLUMN are decoded against today's
+     * information_schema column list. The dropped trailing column must still be decoded by its
+     * binlog type (it used to be skipped as 0 bytes, which yielded a wrong id for the next row).
+     */
+    public function testRowsWrittenBeforeDroppingTheLastColumnStillDecodeCorrectly(): void
+    {
+        $this->disconnect();
+        $this->configBuilder->withUseTableMapMetadata(false);
+        $this->connect();
+
+        if ($this->mySQLReplicationFactory?->getServerInfo()->versionRevision >= 8 && $this->mySQLReplicationFactory?->getServerInfo()->isGeneric()) {
+            self::assertInstanceOf(RotateDTO::class, $this->getEvent());
+        }
+        self::assertInstanceOf(FormatDescriptionEventDTO::class, $this->getEvent());
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+
+        $this->connection->executeStatement('CREATE TABLE test (id INT NOT NULL PRIMARY KEY, a INT, c VARCHAR(10))');
+        $this->connection->executeStatement('INSERT INTO test VALUES (1, 25701, \'xyz\'), (2, 7, \'hello\')');
+        $this->connection->executeStatement('ALTER TABLE test DROP COLUMN c');
+
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+        self::assertInstanceOf(TableMapDTO::class, $this->getEvent());
+
+        $event = $this->getEvent();
+        self::assertInstanceOf(WriteRowsDTO::class, $event);
+        self::assertSame([
+            ['id' => 1, 'a' => 25701, 'DROPPED_COLUMN_2' => 'xyz'],
+            ['id' => 2, 'a' => 7, 'DROPPED_COLUMN_2' => 'hello'],
+        ], $event->values);
+    }
+
     public function testShouldGetWriteEventDropTable(): void
     {
         // exercises the information_schema fallback's "table no longer exists" guard, so force it
@@ -184,10 +218,11 @@ class BasicTest extends BaseCase
         /** @var WriteRowsDTO $event */
         $event = $this->getEvent();
         self::assertInstanceOf(WriteRowsDTO::class, $event);
-        self::assertEquals([
+        // the dropped column is still decoded by its binlog type, so no phantom rows follow
+        self::assertSame([[
             'id' => 1,
-            'DROPPED_COLUMN_1' => null,
-        ], $event->values[0]);
+            'DROPPED_COLUMN_1' => 'A value',
+        ]], $event->values);
 
         $event = $this->getEvent();
         self::assertInstanceOf(WriteRowsDTO::class, $event);
