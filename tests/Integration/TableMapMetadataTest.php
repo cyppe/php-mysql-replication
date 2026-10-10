@@ -151,23 +151,7 @@ class TableMapMetadataTest extends BaseCase
         self::assertInstanceOf(WriteRowsDTO::class, $first);
 
         // Another source sharing the static cache mapped the same table id to a table whose columns have other names.
-        $columns = new ColumnDTOCollection();
-        foreach ($first->tableMap->columnDTOCollection as $column) {
-            $field = $column->fieldDTO;
-            $columns->add(new ColumnDTO(
-                new FieldDTO('other_' . $field->columnName, $field->collationName, $field->characterSetName, $field->columnComment, $field->columnType, $field->columnKey),
-                $column->type,
-                $column->maxLength,
-                $column->size,
-                $column->fsp,
-                $column->lengthSize,
-                $column->precision,
-                $column->decimals,
-                $column->bits,
-                $column->bytes
-            ));
-        }
-        $foreign = new TableMap('other_db', 'other_table', $first->tableMap->tableId, $first->tableMap->columnsAmount, $columns);
+        $foreign = $this->foreignMap($first->tableMap, 'other_db', 'other_table', static fn(string $name): string => 'other_' . $name);
         (new ArrayCache())->set($first->tableMap->tableId, $foreign);
 
         $this->connection->executeStatement('INSERT INTO test VALUES (43, "open", "b", "again")');
@@ -183,6 +167,55 @@ class TableMapMetadataTest extends BaseCase
         self::assertInstanceOf(WriteRowsDTO::class, $rows);
         self::assertSame(['id', 'status', 'tags', 'name'], array_keys($rows->values[0]));
         self::assertSame('again', $rows->values[0]['name']);
+    }
+
+    public function testRequiredMetadataComparesColumnNamesStrictly(): void
+    {
+        $this->reconnectRequiringMetadata();
+
+        $first = $this->createAndInsertValue('CREATE TABLE test (`01` INT UNSIGNED NOT NULL PRIMARY KEY, name VARCHAR(20))', 'INSERT INTO test VALUES (1, "first")');
+        self::assertInstanceOf(WriteRowsDTO::class, $first);
+
+        // Same database, table and layout; only the first column is named "1", which loose == takes for "01".
+        $foreign = $this->foreignMap($first->tableMap, $first->tableMap->database, $first->tableMap->table, static fn(string $name): string => $name === '01' ? '1' : $name);
+        (new ArrayCache())->set($first->tableMap->tableId, $foreign);
+
+        $this->connection->executeStatement('INSERT INTO test VALUES (2, "second")');
+
+        self::assertInstanceOf(XidDTO::class, $this->getEvent());
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+        self::assertInstanceOf(TableMapDTO::class, $this->getEvent());
+
+        $rows = $this->getEvent();
+        self::assertInstanceOf(WriteRowsDTO::class, $rows);
+        self::assertSame(['01', 'name'], array_map('strval', array_keys($rows->values[0])));
+        self::assertArrayHasKey('01', $rows->values[0]);
+        self::assertSame('second', $rows->values[0]['name']);
+    }
+
+    /**
+     * @param callable(string): string $columnName
+     */
+    private function foreignMap(TableMap $map, string $database, string $table, callable $columnName): TableMap
+    {
+        $columns = new ColumnDTOCollection();
+        foreach ($map->columnDTOCollection as $column) {
+            $field = $column->fieldDTO;
+            $columns->add(new ColumnDTO(
+                new FieldDTO($columnName($field->columnName), $field->collationName, $field->characterSetName, $field->columnComment, $field->columnType, $field->columnKey),
+                $column->type,
+                $column->maxLength,
+                $column->size,
+                $column->fsp,
+                $column->lengthSize,
+                $column->precision,
+                $column->decimals,
+                $column->bits,
+                $column->bytes
+            ));
+        }
+
+        return new TableMap($database, $table, $map->tableId, $map->columnsAmount, $columns);
     }
 
     private function reconnectRequiringMetadata(): void

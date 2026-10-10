@@ -42,6 +42,21 @@ class ArrayCacheTest extends TestCase
         self::assertSame('bar', $this->arrayCache->get('foo'));
     }
 
+    public function testReplacingAKeyAtCapacityEvictsNoOtherKey(): void
+    {
+        $cache = new ArrayCache(2);
+        $cache->clear();
+        $cache->set('a', 1);
+        $cache->set('b', 2);
+        $cache->set('c', 3);
+
+        $cache->set('b', 20);
+
+        self::assertTrue($cache->has('a'));
+        self::assertSame(20, $cache->get('b'));
+        self::assertTrue($cache->has('c'));
+    }
+
     public function testShouldDelete(): void
     {
         $this->arrayCache->set('foo', 'bar');

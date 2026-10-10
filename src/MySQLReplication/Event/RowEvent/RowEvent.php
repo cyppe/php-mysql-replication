@@ -375,7 +375,8 @@ class RowEvent extends EventCommon
         // mapped under FULL cannot pass a later MINIMAL map. A map that passes and equals the cached one leaves the cache
         // as it was, so no other table's map is evicted before its rows arrive and the cached map keeps its decoding plan.
         // A map that differs (another source sharing the static cache under the same table id) replaces the cached one.
-        if ($cachedTableMap instanceof TableMap && $cachedTableMap == $tableMap) {
+        // The maps are compared serialized, which is strict and includes private state: loose == takes column "01" for "1".
+        if ($cachedTableMap instanceof TableMap && serialize($cachedTableMap) === serialize($tableMap)) {
             return new TableMapDTO($this->eventInfo, $cachedTableMap);
         }
 
