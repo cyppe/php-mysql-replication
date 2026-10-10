@@ -52,6 +52,21 @@ class TableMapMetadataTest extends BaseCase
         $this->assertColumnMetadataAndValues($event);
     }
 
+    public function testYearColumnDoesNotShiftTheSignednessOfLaterNumericColumns(): void
+    {
+        $event = $this->createAndInsertValue(
+            'CREATE TABLE test (y YEAR, a INT UNSIGNED, b INT, c BIGINT UNSIGNED, d TINYINT)',
+            'INSERT INTO test VALUES (2020, 4294967295, -1, 18446744073709551615, -5)'
+        );
+        self::assertInstanceOf(WriteRowsDTO::class, $event);
+
+        self::assertSame(2020, $event->values[0]['y']);
+        self::assertSame(4294967295, $event->values[0]['a']);
+        self::assertSame(-1, $event->values[0]['b']);
+        self::assertSame('18446744073709551615', $event->values[0]['c']);
+        self::assertSame(-5, $event->values[0]['d']);
+    }
+
     public function testRequiredMetadataDecodesFullMetadataEvents(): void
     {
         $this->reconnectRequiringMetadata();
