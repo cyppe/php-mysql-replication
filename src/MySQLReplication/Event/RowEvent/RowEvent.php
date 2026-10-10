@@ -24,6 +24,7 @@ use MySQLReplication\Repository\RepositoryInterface;
 use Psr\Log\LoggerInterface;
 use Psr\SimpleCache\CacheInterface;
 use RuntimeException;
+use WeakMap;
 
 class RowEvent extends EventCommon
 {
@@ -293,6 +294,16 @@ class RowEvent extends EventCommon
 
     private ?TableMap $currentTableMap;
 
+    /**
+     * @var WeakMap<TableMap, array{0: list<array{0: int, 1: string, 2: int, 3: bool, 4: ColumnDTO}>, 1: string}>|null
+     */
+    private static ?WeakMap $columnPlans = null;
+
+    /**
+     * @var array<string, int> columns-present bitmap => number of present columns, per event
+     */
+    private array $presentCounts = [];
+
     private readonly TableMapCache $tableMapCache;
 
     private readonly TableMapBuilder $tableMapBuilder;
@@ -525,32 +536,34 @@ class RowEvent extends EventCommon
             throw new RuntimeException('Current table map is missing!');
         }
 
+        [$columns, $fullBitmap] = $this->getColumnPlan($this->currentTableMap);
+        // a full row image (every column present) skips the per-column presence test
+        $allPresent = $colsBitmap === $fullBitmap;
+        $presentCount = $allPresent ? count($columns) : ($this->presentCounts[$colsBitmap] ??= $this->bitCount($colsBitmap));
+
         $values = [];
 
         // null bitmap length = (bits set in 'columns-present-bitmap'+7)/8
         // see http://dev.mysql.com/doc/internals/en/rows-event.html
-        $nullBitmap = $this->binaryDataReader->read($this->getColumnsBinarySize($this->bitCount($colsBitmap)));
+        $nullBitmap = $this->binaryDataReader->read($this->getColumnsBinarySize($presentCount));
         $nullBitmapIndex = 0;
 
-        foreach ($this->currentTableMap->columnDTOCollection as $i => $columnDTO) {
-            $name = $columnDTO->getName();
-            $type = $columnDTO->type;
-
-            if ($this->bitGet($colsBitmap, $i) === 0) {
+        foreach ($columns as [$i, $name, $type, $unsigned, $columnDTO]) {
+            if (!$allPresent && (ord($colsBitmap[$i >> 3]) & (1 << ($i & 7))) === 0) {
                 $values[$name] = null;
                 continue;
             }
 
-            if ($this->isNull($nullBitmap, $nullBitmapIndex)) {
+            if ((ord($nullBitmap[$nullBitmapIndex >> 3]) & (1 << ($nullBitmapIndex & 7))) !== 0) {
                 $values[$name] = null;
             } else {
                 $values[$name] = match ($type) {
                     ConstFieldType::IGNORE => $this->getIgnore($columnDTO),
-                    ConstFieldType::TINY => $columnDTO->isUnsigned() ? $this->binaryDataReader->readUInt8() : $this->binaryDataReader->readInt8(),
-                    ConstFieldType::SHORT => $columnDTO->isUnsigned() ? $this->binaryDataReader->readUInt16() : $this->binaryDataReader->readInt16(),
-                    ConstFieldType::LONG => $columnDTO->isUnsigned() ? $this->binaryDataReader->readUInt32() : $this->binaryDataReader->readInt32(),
-                    ConstFieldType::LONGLONG => $columnDTO->isUnsigned() ? $this->binaryDataReader->readUInt64() : $this->binaryDataReader->readInt64(),
-                    ConstFieldType::INT24 => $columnDTO->isUnsigned() ? $this->binaryDataReader->readUInt24() : $this->binaryDataReader->readInt24(),
+                    ConstFieldType::TINY => $unsigned ? $this->binaryDataReader->readUInt8() : $this->binaryDataReader->readInt8(),
+                    ConstFieldType::SHORT => $unsigned ? $this->binaryDataReader->readUInt16() : $this->binaryDataReader->readInt16(),
+                    ConstFieldType::LONG => $unsigned ? $this->binaryDataReader->readUInt32() : $this->binaryDataReader->readInt32(),
+                    ConstFieldType::LONGLONG => $unsigned ? $this->binaryDataReader->readUInt64() : $this->binaryDataReader->readInt64(),
+                    ConstFieldType::INT24 => $unsigned ? $this->binaryDataReader->readUInt24() : $this->binaryDataReader->readInt24(),
                     // http://dev.mysql.com/doc/refman/5.7/en/floating-point-types.html FLOAT(7,4)
                     ConstFieldType::FLOAT => round($this->binaryDataReader->readFloat(), 4),
                     ConstFieldType::DOUBLE => $this->binaryDataReader->readDouble(),
@@ -582,6 +595,35 @@ class RowEvent extends EventCommon
         }
 
         return $values;
+    }
+
+    /**
+     * Per-table decode plan, built once per TableMap instead of once per column per row: the
+     * column offset, name, type, unsigned flag and DTO as a plain list, plus the columns-present
+     * bitmap of a full row image.
+     *
+     * @return array{0: list<array{0: int, 1: string, 2: int, 3: bool, 4: ColumnDTO}>, 1: string}
+     */
+    protected function getColumnPlan(TableMap $tableMap): array
+    {
+        self::$columnPlans ??= new WeakMap();
+
+        if (isset(self::$columnPlans[$tableMap])) {
+            return self::$columnPlans[$tableMap];
+        }
+
+        $columns = [];
+        foreach ($tableMap->columnDTOCollection as $i => $columnDTO) {
+            $columns[] = [$i, $columnDTO->getName(), $columnDTO->type, $columnDTO->isUnsigned(), $columnDTO];
+        }
+
+        $columnsAmount = $tableMap->columnsAmount;
+        $fullBitmap = str_repeat("\xFF", intdiv($columnsAmount, 8));
+        if ($columnsAmount % 8 !== 0) {
+            $fullBitmap .= chr((1 << ($columnsAmount % 8)) - 1);
+        }
+
+        return self::$columnPlans[$tableMap] = [$columns, $fullBitmap];
     }
 
     protected function bitCount(string $bitmap): int

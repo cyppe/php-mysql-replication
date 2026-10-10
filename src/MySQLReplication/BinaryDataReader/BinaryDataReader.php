@@ -252,7 +252,8 @@ class BinaryDataReader
 
     public function readUInt8(): int
     {
-        return self::unpack('C', $this->read(self::UNSIGNED_CHAR_LENGTH))[1];
+        // the hot path of every row: ord() avoids an unpack() call and its array
+        return ord($this->read(self::UNSIGNED_CHAR_LENGTH));
     }
 
     public function readUInt32(): int
@@ -307,7 +308,7 @@ class BinaryDataReader
 
     public function readInt8(): int
     {
-        $re = self::unpack('c', $this->read(self::UNSIGNED_CHAR_LENGTH))[1];
+        $re = ord($this->read(self::UNSIGNED_CHAR_LENGTH));
 
         return $re >= 0x80 ? $re - 0x100 : $re;
     }

@@ -139,6 +139,32 @@ class BasicTest extends BaseCase
         ], $event->values);
     }
 
+    public function testShouldDecodePartialRowImages(): void
+    {
+        $this->createAndInsertValue(
+            'CREATE TABLE test (id INT NOT NULL PRIMARY KEY, a INT, b VARCHAR(10), c INT)',
+            'INSERT INTO test VALUES (1, 10, \'old\', NULL)'
+        );
+
+        // MINIMAL row image: the before image holds only the primary key, the after image only
+        // the changed columns; columns left out decode as null, present NULLs stay null
+        $this->connection->executeStatement('SET SESSION binlog_row_image = MINIMAL');
+        $this->connection->executeStatement('UPDATE test SET b = \'new\', c = NULL, a = 11 WHERE id = 1');
+        $this->connection->executeStatement('SET SESSION binlog_row_image = FULL');
+
+        self::assertInstanceOf(XidDTO::class, $this->getEvent());
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+        self::assertInstanceOf(TableMapDTO::class, $this->getEvent());
+
+        /** @var UpdateRowsDTO $event */
+        $event = $this->getEvent();
+        self::assertInstanceOf(UpdateRowsDTO::class, $event);
+        self::assertSame([[
+            'before' => ['id' => 1, 'a' => null, 'b' => null, 'c' => null],
+            'after' => ['id' => null, 'a' => 11, 'b' => 'new', 'c' => null],
+        ]], $event->values);
+    }
+
     public function testShouldGetWriteEventDropTable(): void
     {
         // exercises the information_schema fallback's "table no longer exists" guard, so force it
