@@ -15,6 +15,7 @@ use MySQLReplication\Definitions\ConstFieldType;
 use MySQLReplication\Definitions\ConstTableMapMetadataFieldType;
 use MySQLReplication\Event\EventInfo;
 use MySQLReplication\Event\RowEvent\TableMapBuilder;
+use MySQLReplication\Event\RowEvent\TableMapMetadataException;
 use MySQLReplication\Repository\FieldDTOCollection;
 use MySQLReplication\Repository\RepositoryInterface;
 use PHPUnit\Framework\TestCase;
@@ -160,6 +161,78 @@ class TableMapBuilderTest extends TestCase
         self::assertTrue($tableMap->columnDTOCollection->isEmpty());
     }
 
+    public function testRequiredMetadataBuildsFromCompleteMetadataWithoutQueryingRepository(): void
+    {
+        $this->repository->expects(self::never())->method('getFields');
+
+        $builder = $this->makeBuilder((new ConfigBuilder())->withRequireTableMapMetadata()->build());
+        $reader = new BinaryDataReader($this->nullBitmap(2) . $this->makeMetadataBlob());
+
+        $tableMap = $builder->build($reader, $this->makeEventInfo(), 'test_db', 'test_table', '1', 2, $this->columnTypes());
+
+        self::assertSame('id', $tableMap->columnDTOCollection->offsetGet(0)->getName());
+        self::assertSame('amount', $tableMap->columnDTOCollection->offsetGet(1)->getName());
+    }
+
+    /**
+     * @return array<string, array{string}>
+     */
+    public static function incompleteMetadataProvider(): array
+    {
+        return [
+            'MINIMAL metadata (signedness only)' => ['minimal'],
+            'only some column names' => ['partial'],
+            'no metadata bytes at all' => ['none'],
+        ];
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('incompleteMetadataProvider')]
+    public function testRequiredMetadataFailsClosedInsteadOfFallingBackToInformationSchema(string $shape): void
+    {
+        $this->repository->expects(self::never())->method('getFields');
+
+        $metadata = match ($shape) {
+            'minimal' => $this->makeMinimalMetadataBlob(),
+            'partial' => $this->makePartialMetadataBlob(),
+            default => '',
+        };
+
+        $builder = $this->makeBuilder((new ConfigBuilder())->withRequireTableMapMetadata()->build());
+        $reader = new BinaryDataReader($this->nullBitmap(2) . $metadata);
+
+        $this->expectException(TableMapMetadataException::class);
+        $this->expectExceptionCode(TableMapMetadataException::INCOMPLETE_METADATA_CODE);
+        $this->expectExceptionMessage('TABLE_MAP_EVENT for test_db.test_table (table_id 1, ending at binlog.001:120)');
+
+        $builder->build($reader, $this->makeEventInfo(), 'test_db', 'test_table', '1', 2, $this->columnTypes());
+    }
+
+    public function testEnumWithoutItsLiteralsIsIncompleteMetadata(): void
+    {
+        $this->repository->expects(self::once())
+            ->method('getFields')
+            ->willReturn($this->makeFieldDTOCollection());
+
+        $field = static fn (int $type, string $payload): string => chr($type) . chr(strlen($payload)) . $payload;
+        $columnName = static fn (string $name): string => chr(strlen($name)) . $name;
+        // names for both columns but no ENUM_STR_VALUE field for the ENUM column
+        $metadata = $field(ConstTableMapMetadataFieldType::SIGNEDNESS, chr(0))
+            . $field(ConstTableMapMetadataFieldType::COLUMN_NAME, $columnName('id') . $columnName('status'));
+
+        $columnTypes = chr(ConstFieldType::LONG) . chr(ConstFieldType::STRING);
+        // structural metadata of the STRING column: real type ENUM, 1 byte storage
+        $structural = chr(ConstFieldType::ENUM) . chr(1);
+
+        $builder = $this->makeBuilder((new ConfigBuilder())->build());
+        $reader = new BinaryDataReader($structural . $this->nullBitmap(2) . $metadata);
+        $tableMap = $builder->build($reader, $this->makeEventInfo(), 'test_db', 'test_table', '1', 2, $columnTypes);
+        self::assertSame('id_from_schema', $tableMap->columnDTOCollection->offsetGet(0)->getName());
+
+        $requiring = $this->makeBuilder((new ConfigBuilder())->withRequireTableMapMetadata()->build());
+        $this->expectException(TableMapMetadataException::class);
+        $requiring->build(new BinaryDataReader($structural . $this->nullBitmap(2) . $metadata), $this->makeEventInfo(), 'test_db', 'test_table', '1', 2, $columnTypes);
+    }
+
     private function makeBuilder(Config $config): TableMapBuilder
     {
         return new TableMapBuilder($this->repository, $config, new NullLogger());
@@ -236,6 +309,6 @@ class TableMapBuilderTest extends TestCase
         $binLogCurrent->setBinFileName('binlog.001');
         $binLogCurrent->setBinLogPosition('0');
 
-        return new EventInfo(1620000000, ConstEventType::QUERY_EVENT->value, 1, 100, '0', 0, false, $binLogCurrent);
+        return new EventInfo(1620000000, ConstEventType::TABLE_MAP_EVENT->value, 1, 100, '120', 0, false, $binLogCurrent);
     }
 }

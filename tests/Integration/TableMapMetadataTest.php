@@ -10,6 +10,7 @@ use MySQLReplication\Event\DTO\FormatDescriptionEventDTO;
 use MySQLReplication\Event\DTO\QueryDTO;
 use MySQLReplication\Event\DTO\RotateDTO;
 use MySQLReplication\Event\DTO\WriteRowsDTO;
+use MySQLReplication\Event\RowEvent\TableMapMetadataException;
 
 class TableMapMetadataTest extends BaseCase
 {
@@ -49,6 +50,55 @@ class TableMapMetadataTest extends BaseCase
         self::assertInstanceOf(WriteRowsDTO::class, $event);
 
         $this->assertColumnMetadataAndValues($event);
+    }
+
+    public function testRequiredMetadataDecodesFullMetadataEvents(): void
+    {
+        $this->reconnectRequiringMetadata();
+
+        $event = $this->createAndInsertValue(self::CREATE_QUERY, self::INSERT_QUERY);
+        self::assertInstanceOf(WriteRowsDTO::class, $event);
+
+        $this->assertColumnMetadataAndValues($event);
+    }
+
+    public function testRequiredMetadataFailsClosedOnMinimalMetadataEvents(): void
+    {
+        $this->reconnectRequiringMetadata();
+
+        $this->connection->executeStatement(self::CREATE_QUERY);
+        $this->connection->executeStatement('SET GLOBAL binlog_row_metadata = MINIMAL');
+        try {
+            $this->connection->executeStatement(self::INSERT_QUERY);
+        } finally {
+            $this->connection->executeStatement('SET GLOBAL binlog_row_metadata = FULL');
+        }
+
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+
+        $this->expectException(TableMapMetadataException::class);
+        $this->expectExceptionMessage('TABLE_MAP_EVENT for mysqlreplication_test.test');
+        $this->getEvent();
+    }
+
+    private function reconnectRequiringMetadata(): void
+    {
+        if ($this->mySQLReplicationFactory?->getServerInfo()->isMariaDb()
+            || $this->connection->fetchOne('SELECT @@GLOBAL.binlog_row_metadata') !== 'FULL') {
+            self::markTestSkipped('Needs a MySQL source with binlog_row_metadata=FULL');
+        }
+
+        $this->disconnect();
+        $this->configBuilder->withRequireTableMapMetadata();
+        $this->connect();
+
+        if ($this->mySQLReplicationFactory?->getServerInfo()->versionRevision >= 8 && $this->mySQLReplicationFactory?->getServerInfo()->isGeneric()) {
+            self::assertInstanceOf(RotateDTO::class, $this->getEvent());
+        }
+        self::assertInstanceOf(FormatDescriptionEventDTO::class, $this->getEvent());
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
     }
 
     private function assertColumnMetadataAndValues(WriteRowsDTO $event): void

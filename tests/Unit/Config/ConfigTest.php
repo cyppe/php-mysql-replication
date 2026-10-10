@@ -120,6 +120,24 @@ class ConfigTest extends TestCase
         self::assertFalse($config->useTableMapMetadata);
     }
 
+    public function testShouldSetRequireTableMapMetadata(): void
+    {
+        self::assertFalse((new ConfigBuilder())->build()->requireTableMapMetadata);
+
+        $config = (new ConfigBuilder())->withRequireTableMapMetadata()->build();
+        self::assertTrue($config->requireTableMapMetadata);
+        $config->validate();
+    }
+
+    public function testRequiringTableMapMetadataWhileNotUsingItIsRejected(): void
+    {
+        $config = (new ConfigBuilder())->withUseTableMapMetadata(false)->withRequireTableMapMetadata()->build();
+
+        $this->expectException(ConfigException::class);
+        $this->expectExceptionCode(ConfigException::REQUIRE_TABLE_MAP_METADATA_ERROR_CODE);
+        $config->validate();
+    }
+
     public function testShouldCheckDataBasesOnly(): void
     {
         $config = (new ConfigBuilder())->withDatabasesOnly(['boo'])->build();

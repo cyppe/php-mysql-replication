@@ -46,9 +46,19 @@ readonly class TableMapBuilder
         // binlog_row_metadata=MINIMAL still writes a metadata block (e.g. signedness) but
         // never a complete column-name list; only FULL emits COLUMN_NAME for every
         // column, so an empty or partial list cannot safely replace information_schema.
-        if ($tableMapMetadata !== null && count($tableMapMetadata->columnNames) === $columnsAmount) {
+        if ($tableMapMetadata !== null && $this->isComplete($tableMapMetadata, $rawColumnDTOs)) {
             $this->logger->debug('Resolving column metadata for ' . $schemaName . '.' . $tableName . ' from TABLE_MAP_EVENT metadata');
             $fieldDTOCollection = $this->makeFieldDTOCollectionFromMetadata($rawColumnDTOs, $tableMapMetadata);
+        } elseif ($this->config->requireTableMapMetadata) {
+            throw TableMapMetadataException::incomplete(
+                $schemaName,
+                $tableName,
+                $tableId,
+                $columnsAmount,
+                $tableMapMetadata === null ? 0 : count($tableMapMetadata->columnNames),
+                $eventInfo->binLogCurrent->getBinFileName(),
+                $eventInfo->pos
+            );
         } else {
             $this->logger->debug('Resolving column metadata for ' . $schemaName . '.' . $tableName . ' from information_schema');
             $fieldDTOCollection = $this->repository->getFields($schemaName, $tableName);
@@ -98,6 +108,31 @@ readonly class TableMapBuilder
             $metadataLength,
             array_map(static fn (ColumnDTO $columnDTO): int => $columnDTO->type, $rawColumnDTOs)
         );
+    }
+
+    /**
+     * Complete means the metadata can fully replace information_schema: a name for every
+     * column and the literal list of every ENUM/SET column (FULL writes all of them or,
+     * on a server-side failure, none of the optional fields).
+     *
+     * @param array<int, ColumnDTO> $rawColumnDTOs
+     */
+    private function isComplete(TableMapMetadata $tableMapMetadata, array $rawColumnDTOs): bool
+    {
+        if (count($tableMapMetadata->columnNames) !== count($rawColumnDTOs)) {
+            return false;
+        }
+
+        foreach ($rawColumnDTOs as $offset => $rawColumnDTO) {
+            if ($rawColumnDTO->type === ConstFieldType::ENUM && !isset($tableMapMetadata->enumValues[$offset])) {
+                return false;
+            }
+            if ($rawColumnDTO->type === ConstFieldType::SET && !isset($tableMapMetadata->setValues[$offset])) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /**

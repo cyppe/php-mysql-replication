@@ -56,6 +56,8 @@ class ConfigBuilder
 
     private bool $useTableMapMetadata = true;
 
+    private bool $requireTableMapMetadata = false;
+
     public function withGtidAutoPosition(bool $gtidAutoPosition = true): self
     {
         $this->gtidAutoPosition = $gtidAutoPosition;
@@ -87,6 +89,21 @@ class ConfigBuilder
     public function withUseTableMapMetadata(bool $useTableMapMetadata = true): self
     {
         $this->useTableMapMetadata = $useTableMapMetadata;
+
+        return $this;
+    }
+
+    /**
+     * When true, every TABLE_MAP_EVENT must carry complete column metadata (a name for every
+     * column and the literals of every ENUM/SET column, i.e. binlog_row_metadata=FULL). An
+     * incomplete event throws a TableMapMetadataException instead of silently falling back to
+     * information_schema, whose current column list can mislabel or misdecode rows written
+     * before a schema change. Requires withUseTableMapMetadata(true). Enable it only once every
+     * binlog the consumer can still read was written with binlog_row_metadata=FULL.
+     */
+    public function withRequireTableMapMetadata(bool $requireTableMapMetadata = true): self
+    {
+        $this->requireTableMapMetadata = $requireTableMapMetadata;
 
         return $this;
     }
@@ -277,6 +294,7 @@ class ConfigBuilder
             $this->useTableMapMetadata,
             $this->tablesIgnore,
             $this->databasesIgnore,
+            $this->requireTableMapMetadata,
         );
     }
 }
