@@ -804,6 +804,25 @@ class TypesTest extends BaseCase
         self::assertSame('-12:33:07.123456', $event->values[0]['f']);
     }
 
+    public function testShouldDecodeLiteralsAndShortIntsInsideLargeJsonDocuments(): void
+    {
+        if ($this->checkForVersion(5.7) || $this->mySQLReplicationFactory?->getServerInfo()->isMariaDb()) {
+            self::markTestIncomplete('Only for mysql 5.7 or higher');
+        }
+
+        // documents above 64 KiB use the large format, whose value entries are 1 + 4 bytes wide
+        $padding = str_repeat('x', 70000);
+        $event = $this->createAndInsertValue(
+            'CREATE TABLE test (j JSON)',
+            "INSERT INTO test VALUES ('{\"a\":true,\"b\":null,\"c\":false,\"d\":7,\"e\":-3,\"f\":\"" . $padding . "\"}'), ('[true,7,null,false,-3,\"" . $padding . "\"]')"
+        );
+
+        self::assertSame('{"a":true,"b":null,"c":false,"d":7,"e":-3,"f":"' . $padding . '"}', $event->values[0]['j']);
+        // each row is larger than binlog_row_event_max_size, so the second one gets its own event
+        $second = count($event->values) > 1 ? $event : $this->getEvent();
+        self::assertSame('[true,7,null,false,-3,"' . $padding . '"]', $second->values[count($second->values) - 1]['j']);
+    }
+
     public function testShouldBeJson(): void
     {
         if ($this->checkForVersion(5.7) || $this->mySQLReplicationFactory?->getServerInfo()->isMariaDb()) {
