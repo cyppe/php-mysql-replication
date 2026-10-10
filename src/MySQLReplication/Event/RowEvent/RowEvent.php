@@ -372,9 +372,10 @@ class RowEvent extends EventCommon
         );
 
         // Require mode builds every TABLE_MAP_EVENT, cached or not, so the builder checks its own metadata: a table first
-        // mapped under FULL cannot pass a later MINIMAL map. A map that passes leaves the cache as it was, so no other
-        // table's map is evicted before its rows arrive and the cached map keeps its decoding plan.
-        if ($cachedTableMap instanceof TableMap) {
+        // mapped under FULL cannot pass a later MINIMAL map. A map that passes and equals the cached one leaves the cache
+        // as it was, so no other table's map is evicted before its rows arrive and the cached map keeps its decoding plan.
+        // A map that differs (another source sharing the static cache under the same table id) replaces the cached one.
+        if ($cachedTableMap instanceof TableMap && $cachedTableMap == $tableMap) {
             return new TableMapDTO($this->eventInfo, $cachedTableMap);
         }
 
