@@ -8,6 +8,8 @@ use MySQLReplication\Exception\MySQLReplicationException;
 
 class ConfigException extends MySQLReplicationException
 {
+    public const REQUIRE_TABLE_MAP_METADATA_ERROR_MESSAGE = 'requireTableMapMetadata needs useTableMapMetadata enabled';
+    public const REQUIRE_TABLE_MAP_METADATA_ERROR_CODE = 416;
     public const TABLE_CACHE_SIZE_ERROR_MESSAGE = 'Table cache must be integer';
     public const TABLE_CACHE_SIZE_ERROR_CODE = 411;
     public const HEARTBEAT_PERIOD_ERROR_MESSAGE = 'Heartbeat period must be integer min:1 max:4294967';

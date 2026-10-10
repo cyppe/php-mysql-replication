@@ -6,10 +6,18 @@ declare(strict_types=1);
 
 namespace MySQLReplication\Tests\Integration;
 
+use MySQLReplication\Cache\ArrayCache;
 use MySQLReplication\Event\DTO\FormatDescriptionEventDTO;
 use MySQLReplication\Event\DTO\QueryDTO;
 use MySQLReplication\Event\DTO\RotateDTO;
+use MySQLReplication\Event\DTO\TableMapDTO;
 use MySQLReplication\Event\DTO\WriteRowsDTO;
+use MySQLReplication\Event\DTO\XidDTO;
+use MySQLReplication\Event\RowEvent\ColumnDTO;
+use MySQLReplication\Event\RowEvent\ColumnDTOCollection;
+use MySQLReplication\Event\RowEvent\TableMap;
+use MySQLReplication\Event\RowEvent\TableMapMetadataException;
+use MySQLReplication\Repository\FieldDTO;
 
 class TableMapMetadataTest extends BaseCase
 {
@@ -49,6 +57,184 @@ class TableMapMetadataTest extends BaseCase
         self::assertInstanceOf(WriteRowsDTO::class, $event);
 
         $this->assertColumnMetadataAndValues($event);
+    }
+
+    public function testYearColumnDoesNotShiftTheSignednessOfLaterNumericColumns(): void
+    {
+        $event = $this->createAndInsertValue(
+            'CREATE TABLE test (y YEAR, a INT UNSIGNED, b INT, c BIGINT UNSIGNED, d TINYINT)',
+            'INSERT INTO test VALUES (2020, 4294967295, -1, 18446744073709551615, -5)'
+        );
+        self::assertInstanceOf(WriteRowsDTO::class, $event);
+
+        self::assertSame(2020, $event->values[0]['y']);
+        self::assertSame(4294967295, $event->values[0]['a']);
+        self::assertSame(-1, $event->values[0]['b']);
+        self::assertSame('18446744073709551615', $event->values[0]['c']);
+        self::assertSame(-5, $event->values[0]['d']);
+    }
+
+    public function testRequiredMetadataDecodesFullMetadataEvents(): void
+    {
+        $this->reconnectRequiringMetadata();
+
+        $event = $this->createAndInsertValue(self::CREATE_QUERY, self::INSERT_QUERY);
+        self::assertInstanceOf(WriteRowsDTO::class, $event);
+
+        $this->assertColumnMetadataAndValues($event);
+    }
+
+    public function testRequiredMetadataFailsClosedOnMinimalMetadataEvents(): void
+    {
+        $this->reconnectRequiringMetadata();
+
+        $this->connection->executeStatement(self::CREATE_QUERY);
+        $this->connection->executeStatement('SET GLOBAL binlog_row_metadata = MINIMAL');
+        try {
+            $this->connection->executeStatement(self::INSERT_QUERY);
+        } finally {
+            $this->connection->executeStatement('SET GLOBAL binlog_row_metadata = FULL');
+        }
+
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+
+        $this->expectException(TableMapMetadataException::class);
+        $this->expectExceptionMessage('TABLE_MAP_EVENT for mysqlreplication_test.test');
+        $this->getEvent();
+    }
+
+    public function testRequiredMetadataChecksATableMapItHasCachedAlready(): void
+    {
+        $this->reconnectRequiringMetadata();
+
+        self::assertInstanceOf(WriteRowsDTO::class, $this->createAndInsertValue(self::CREATE_QUERY, self::INSERT_QUERY));
+
+        $this->connection->executeStatement('SET GLOBAL binlog_row_metadata = MINIMAL');
+        try {
+            $this->connection->executeStatement('INSERT INTO test VALUES (43, "open", "b", "again")');
+        } finally {
+            $this->connection->executeStatement('SET GLOBAL binlog_row_metadata = FULL');
+        }
+
+        self::assertInstanceOf(XidDTO::class, $this->getEvent());
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+
+        $this->expectException(TableMapMetadataException::class);
+        $this->expectExceptionMessage('TABLE_MAP_EVENT for mysqlreplication_test.test');
+        $this->getEvent();
+    }
+
+    public function testRequiredMetadataKeepsTheCachedMapOfATableThatPassesAgain(): void
+    {
+        $this->reconnectRequiringMetadata();
+
+        $first = $this->createAndInsertValue(self::CREATE_QUERY, self::INSERT_QUERY);
+        self::assertInstanceOf(WriteRowsDTO::class, $first);
+
+        $this->connection->executeStatement('INSERT INTO test VALUES (43, "open", "b", "again")');
+
+        self::assertInstanceOf(XidDTO::class, $this->getEvent());
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+        $tableMapEvent = $this->getEvent();
+        self::assertInstanceOf(TableMapDTO::class, $tableMapEvent);
+
+        // The second map was checked and passed; the cache still holds the first map, so nothing was re-set or evicted.
+        self::assertSame($first->tableMap, $tableMapEvent->tableMap);
+    }
+
+    public function testRequiredMetadataReplacesACachedMapThatDiffersFromTheEvent(): void
+    {
+        $this->reconnectRequiringMetadata();
+
+        $first = $this->createAndInsertValue(self::CREATE_QUERY, self::INSERT_QUERY);
+        self::assertInstanceOf(WriteRowsDTO::class, $first);
+
+        // Another source sharing the static cache mapped the same table id to a table whose columns have other names.
+        $foreign = $this->foreignMap($first->tableMap, 'other_db', 'other_table', static fn(string $name): string => 'other_' . $name);
+        (new ArrayCache())->set($first->tableMap->tableId, $foreign);
+
+        $this->connection->executeStatement('INSERT INTO test VALUES (43, "open", "b", "again")');
+
+        self::assertInstanceOf(XidDTO::class, $this->getEvent());
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+        $tableMapEvent = $this->getEvent();
+        self::assertInstanceOf(TableMapDTO::class, $tableMapEvent);
+        self::assertSame('test', $tableMapEvent->tableMap->table);
+        self::assertNotSame($foreign, (new ArrayCache())->get($first->tableMap->tableId));
+
+        $rows = $this->getEvent();
+        self::assertInstanceOf(WriteRowsDTO::class, $rows);
+        self::assertSame(['id', 'status', 'tags', 'name'], array_keys($rows->values[0]));
+        self::assertSame('again', $rows->values[0]['name']);
+    }
+
+    public function testRequiredMetadataComparesColumnNamesStrictly(): void
+    {
+        $this->reconnectRequiringMetadata();
+
+        $first = $this->createAndInsertValue('CREATE TABLE test (`01` INT UNSIGNED NOT NULL PRIMARY KEY, name VARCHAR(20))', 'INSERT INTO test VALUES (1, "first")');
+        self::assertInstanceOf(WriteRowsDTO::class, $first);
+
+        // Same database, table and layout; only the first column is named "1", which loose == takes for "01".
+        $foreign = $this->foreignMap($first->tableMap, $first->tableMap->database, $first->tableMap->table, static fn(string $name): string => $name === '01' ? '1' : $name);
+        (new ArrayCache())->set($first->tableMap->tableId, $foreign);
+
+        $this->connection->executeStatement('INSERT INTO test VALUES (2, "second")');
+
+        self::assertInstanceOf(XidDTO::class, $this->getEvent());
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+        self::assertInstanceOf(TableMapDTO::class, $this->getEvent());
+
+        $rows = $this->getEvent();
+        self::assertInstanceOf(WriteRowsDTO::class, $rows);
+        self::assertSame(['01', 'name'], array_map('strval', array_keys($rows->values[0])));
+        self::assertArrayHasKey('01', $rows->values[0]);
+        self::assertSame('second', $rows->values[0]['name']);
+    }
+
+    /**
+     * @param callable(string): string $columnName
+     */
+    private function foreignMap(TableMap $map, string $database, string $table, callable $columnName): TableMap
+    {
+        $columns = new ColumnDTOCollection();
+        foreach ($map->columnDTOCollection as $column) {
+            $field = $column->fieldDTO;
+            $columns->add(new ColumnDTO(
+                new FieldDTO($columnName($field->columnName), $field->collationName, $field->characterSetName, $field->columnComment, $field->columnType, $field->columnKey),
+                $column->type,
+                $column->maxLength,
+                $column->size,
+                $column->fsp,
+                $column->lengthSize,
+                $column->precision,
+                $column->decimals,
+                $column->bits,
+                $column->bytes
+            ));
+        }
+
+        return new TableMap($database, $table, $map->tableId, $map->columnsAmount, $columns);
+    }
+
+    private function reconnectRequiringMetadata(): void
+    {
+        if ($this->mySQLReplicationFactory?->getServerInfo()->isMariaDb()
+            || $this->connection->fetchOne('SELECT @@GLOBAL.binlog_row_metadata') !== 'FULL') {
+            self::markTestSkipped('Needs a MySQL source with binlog_row_metadata=FULL');
+        }
+
+        $this->disconnect();
+        $this->configBuilder->withRequireTableMapMetadata();
+        $this->connect();
+
+        if ($this->mySQLReplicationFactory?->getServerInfo()->versionRevision >= 8 && $this->mySQLReplicationFactory?->getServerInfo()->isGeneric()) {
+            self::assertInstanceOf(RotateDTO::class, $this->getEvent());
+        }
+        self::assertInstanceOf(FormatDescriptionEventDTO::class, $this->getEvent());
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
     }
 
     private function assertColumnMetadataAndValues(WriteRowsDTO $event): void

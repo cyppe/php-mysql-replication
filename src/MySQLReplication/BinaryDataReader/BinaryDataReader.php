@@ -44,9 +44,20 @@ class BinaryDataReader
 
     private bool $hasPushback = false;
 
+    private readonly int $binaryDataLength;
+
+    /**
+     * @param bool $failOnReadPastEnd throw instead of returning a short string when a read runs past
+     *                                the data; on for whole-event readers, where an over-read always
+     *                                means the decoder lost its place (e.g. column metadata that does
+     *                                not match the row image). Off by default because nested readers
+     *                                (JSON documents, metadata fields) rely on lenient trailing reads.
+     */
     public function __construct(
-        private readonly string $binaryData
+        private readonly string $binaryData,
+        private readonly bool $failOnReadPastEnd = false
     ) {
+        $this->binaryDataLength = strlen($binaryData);
     }
 
     public static function pack64bit(int $value): string
@@ -71,7 +82,9 @@ class BinaryDataReader
 
     public function readInt16(): int
     {
-        return self::unpack('s', $this->read(self::UNSIGNED_SHORT_LENGTH))[1];
+        $re = self::unpack('v', $this->read(self::UNSIGNED_SHORT_LENGTH))[1];
+
+        return $re >= 0x8000 ? $re - 0x10000 : $re;
     }
 
     public function read(int $length): string
@@ -84,6 +97,9 @@ class BinaryDataReader
         if (!$this->hasPushback) {
             $offset = $this->offset;
             $this->offset = $offset + $length;
+            if ($this->failOnReadPastEnd && $this->offset > $this->binaryDataLength) {
+                throw BinaryDataReaderException::readPastEnd($length, $this->binaryDataLength - $offset);
+            }
 
             // Single-byte reads (readUInt8/readInt8/marker peeks/bitmap bytes) dominate call
             // volume — direct offset access skips the substr() call entirely for that case.
@@ -100,6 +116,9 @@ class BinaryDataReader
         }
 
         $fromBinary = $length - $pushbackLength;
+        if ($this->failOnReadPastEnd && $this->offset + $fromBinary > $this->binaryDataLength) {
+            throw BinaryDataReaderException::readPastEnd($length, $pushbackLength + $this->binaryDataLength - $this->offset);
+        }
         $result = $this->pushback . substr($this->binaryData, $this->offset, $fromBinary);
         $this->pushback = '';
         $this->hasPushback = false;
@@ -233,18 +252,19 @@ class BinaryDataReader
 
     public function readUInt8(): int
     {
-        return self::unpack('C', $this->read(self::UNSIGNED_CHAR_LENGTH))[1];
+        // the hot path of every row: ord() avoids an unpack() call and its array
+        return ord($this->read(self::UNSIGNED_CHAR_LENGTH));
     }
 
     public function readUInt32(): int
     {
-        return self::unpack('I', $this->read(self::UNSIGNED_INT32_LENGTH))[1];
+        return self::unpack('V', $this->read(self::UNSIGNED_INT32_LENGTH))[1];
     }
 
     public function readUInt40(): int
     {
         $data1 = self::unpack('C', $this->read(self::UNSIGNED_CHAR_LENGTH))[1];
-        $data2 = self::unpack('I', $this->read(self::UNSIGNED_INT32_LENGTH))[1];
+        $data2 = self::unpack('V', $this->read(self::UNSIGNED_INT32_LENGTH))[1];
 
         return $data1 + ($data2 << 8);
     }
@@ -259,8 +279,8 @@ class BinaryDataReader
     public function readUInt56(): int
     {
         $data1 = self::unpack('C', $this->read(self::UNSIGNED_CHAR_LENGTH))[1];
-        $data2 = self::unpack('S', $this->read(self::UNSIGNED_SHORT_LENGTH))[1];
-        $data3 = self::unpack('I', $this->read(self::UNSIGNED_INT32_LENGTH))[1];
+        $data2 = self::unpack('v', $this->read(self::UNSIGNED_SHORT_LENGTH))[1];
+        $data3 = self::unpack('V', $this->read(self::UNSIGNED_INT32_LENGTH))[1];
 
         return $data1 + ($data2 << 8) + ($data3 << 24);
     }
@@ -288,7 +308,7 @@ class BinaryDataReader
 
     public function readInt8(): int
     {
-        $re = self::unpack('c', $this->read(self::UNSIGNED_CHAR_LENGTH))[1];
+        $re = ord($this->read(self::UNSIGNED_CHAR_LENGTH));
 
         return $re >= 0x80 ? $re - 0x100 : $re;
     }
@@ -325,17 +345,19 @@ class BinaryDataReader
 
     public function readInt32(): int
     {
-        return self::unpack('i', $this->read(self::UNSIGNED_INT32_LENGTH))[1];
+        $re = self::unpack('V', $this->read(self::UNSIGNED_INT32_LENGTH))[1];
+
+        return $re >= 0x80000000 ? $re - 0x100000000 : $re;
     }
 
     public function readFloat(): float
     {
-        return self::unpack('f', $this->read(self::UNSIGNED_FLOAT_LENGTH))[1];
+        return self::unpack('g', $this->read(self::UNSIGNED_FLOAT_LENGTH))[1];
     }
 
     public function readDouble(): float
     {
-        return self::unpack('d', $this->read(self::UNSIGNED_DOUBLE_LENGTH))[1];
+        return self::unpack('e', $this->read(self::UNSIGNED_DOUBLE_LENGTH))[1];
     }
 
     public function readTableId(): string

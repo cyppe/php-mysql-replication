@@ -119,6 +119,7 @@ Use `ConfigBuilder` or `ConfigFactory` to create configuration.
 | `gtidAutoPosition` | enables GTID auto positioning, letting the master decide where to start streaming from based on the GTID set already processed (default `false`) |
 | `semiSync` | opt in to semi-sync replication. If the master doesn't have `rpl_semi_sync_master_enabled`/`rpl_semi_sync_source_enabled` = `ON`, this is silently ignored and the connection falls back to async replication (default `false`) |
 | `useTableMapMetadata` | read column names/unsigned flags/ENUM-SET literals/primary key from the `TABLE_MAP_EVENT`'s optional metadata (requires `binlog_row_metadata=FULL` on the server), avoiding an `information_schema` query per table. Falls back to `information_schema` when that metadata isn't present. Set to `false` to always use `information_schema`, e.g. if you need `COLLATION_NAME`/`CHARACTER_SET_NAME`/`COLUMN_COMMENT` (default `true`) |
+| `requireTableMapMetadata` | fail closed instead of falling back: throw `TableMapMetadataException` when a `TABLE_MAP_EVENT` lacks complete column names (or ENUM/SET literals), i.e. the server is not on `binlog_row_metadata=FULL`. Prevents silently mislabelled columns after DDL when `information_schema` no longer matches the binlog. Requires `useTableMapMetadata` (default `false`) |
 
 ## 💡 Examples
 

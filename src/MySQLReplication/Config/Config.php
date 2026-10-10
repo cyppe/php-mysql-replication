@@ -34,6 +34,7 @@ readonly class Config implements JsonSerializable
         public bool $useTableMapMetadata = true,
         public array $tablesIgnore = [],
         public array $databasesIgnore = [],
+        public bool $requireTableMapMetadata = false,
     ) {
     }
 
@@ -78,6 +79,12 @@ readonly class Config implements JsonSerializable
             ],
         ]) === false) {
             throw new ConfigException(ConfigException::TABLE_CACHE_SIZE_ERROR_MESSAGE, ConfigException::TABLE_CACHE_SIZE_ERROR_CODE);
+        }
+        if ($this->requireTableMapMetadata && !$this->useTableMapMetadata) {
+            throw new ConfigException(
+                ConfigException::REQUIRE_TABLE_MAP_METADATA_ERROR_MESSAGE,
+                ConfigException::REQUIRE_TABLE_MAP_METADATA_ERROR_CODE
+            );
         }
         if ($this->heartbeatPeriod !== 0.0 && false === ($this->heartbeatPeriod >= 0.001 && $this->heartbeatPeriod <= 4294967.0)) {
             throw new ConfigException(ConfigException::HEARTBEAT_PERIOD_ERROR_MESSAGE, ConfigException::HEARTBEAT_PERIOD_ERROR_CODE);

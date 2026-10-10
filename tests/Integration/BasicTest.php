@@ -66,6 +66,105 @@ class BasicTest extends BaseCase
         self::assertEquals('World', $event->values[0]['after']['data']);
     }
 
+    public function testShouldDecodeRowEventsOfAPartitionedTable(): void
+    {
+        // MySQL 8.0.16+ writes the partition id into the extra-row-info of every v2 rows event of a
+        // partitioned table, so the extra data block is longer than its own 2-byte length field.
+        $event = $this->createAndInsertValue(
+            'CREATE TABLE test (id INT NOT NULL, data VARCHAR(50) NOT NULL, PRIMARY KEY (id)) PARTITION BY HASH(id) PARTITIONS 4',
+            'INSERT INTO test VALUES (1, \'Hello\'), (2, \'There\')'
+        );
+        self::assertInstanceOf(WriteRowsDTO::class, $event);
+        self::assertSame([['id' => 1, 'data' => 'Hello']], $event->values);
+        // the second row lands in another partition, so MySQL writes it as its own rows event
+        $event = $this->getEvent();
+        self::assertInstanceOf(WriteRowsDTO::class, $event);
+        self::assertSame([['id' => 2, 'data' => 'There']], $event->values);
+
+        // moving the row to another partition writes both the source and the target partition id
+        $this->connection->executeStatement('UPDATE test SET data = \'World\', id = 3 WHERE id = 1');
+
+        self::assertInstanceOf(XidDTO::class, $this->getEvent());
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+        self::assertInstanceOf(TableMapDTO::class, $this->getEvent());
+
+        /** @var UpdateRowsDTO $event */
+        $event = $this->getEvent();
+        self::assertInstanceOf(UpdateRowsDTO::class, $event);
+        self::assertSame([['before' => ['id' => 1, 'data' => 'Hello'], 'after' => ['id' => 3, 'data' => 'World']]], $event->values);
+
+        $this->connection->executeStatement('DELETE FROM test WHERE id = 2');
+
+        self::assertInstanceOf(XidDTO::class, $this->getEvent());
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+        self::assertInstanceOf(TableMapDTO::class, $this->getEvent());
+
+        /** @var DeleteRowsDTO $event */
+        $event = $this->getEvent();
+        self::assertInstanceOf(DeleteRowsDTO::class, $event);
+        self::assertSame([['id' => 2, 'data' => 'There']], $event->values);
+    }
+
+    /**
+     * Without FULL metadata, rows written before a DROP COLUMN are decoded against today's
+     * information_schema column list. The dropped trailing column must still be decoded by its
+     * binlog type (it used to be skipped as 0 bytes, which yielded a wrong id for the next row).
+     */
+    public function testRowsWrittenBeforeDroppingTheLastColumnStillDecodeCorrectly(): void
+    {
+        $this->disconnect();
+        $this->configBuilder->withUseTableMapMetadata(false);
+        $this->connect();
+
+        if ($this->mySQLReplicationFactory?->getServerInfo()->versionRevision >= 8 && $this->mySQLReplicationFactory?->getServerInfo()->isGeneric()) {
+            self::assertInstanceOf(RotateDTO::class, $this->getEvent());
+        }
+        self::assertInstanceOf(FormatDescriptionEventDTO::class, $this->getEvent());
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+
+        $this->connection->executeStatement('CREATE TABLE test (id INT NOT NULL PRIMARY KEY, a INT, c VARCHAR(10))');
+        $this->connection->executeStatement('INSERT INTO test VALUES (1, 25701, \'xyz\'), (2, 7, \'hello\')');
+        $this->connection->executeStatement('ALTER TABLE test DROP COLUMN c');
+
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+        self::assertInstanceOf(TableMapDTO::class, $this->getEvent());
+
+        $event = $this->getEvent();
+        self::assertInstanceOf(WriteRowsDTO::class, $event);
+        self::assertSame([
+            ['id' => 1, 'a' => 25701, 'DROPPED_COLUMN_2' => 'xyz'],
+            ['id' => 2, 'a' => 7, 'DROPPED_COLUMN_2' => 'hello'],
+        ], $event->values);
+    }
+
+    public function testShouldDecodePartialRowImages(): void
+    {
+        $this->createAndInsertValue(
+            'CREATE TABLE test (id INT NOT NULL PRIMARY KEY, a INT, b VARCHAR(10), c INT)',
+            'INSERT INTO test VALUES (1, 10, \'old\', NULL)'
+        );
+
+        // MINIMAL row image: the before image holds only the primary key, the after image only
+        // the changed columns; columns left out decode as null, present NULLs stay null
+        $this->connection->executeStatement('SET SESSION binlog_row_image = MINIMAL');
+        $this->connection->executeStatement('UPDATE test SET b = \'new\', c = NULL, a = 11 WHERE id = 1');
+        $this->connection->executeStatement('SET SESSION binlog_row_image = FULL');
+
+        self::assertInstanceOf(XidDTO::class, $this->getEvent());
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+        self::assertInstanceOf(TableMapDTO::class, $this->getEvent());
+
+        /** @var UpdateRowsDTO $event */
+        $event = $this->getEvent();
+        self::assertInstanceOf(UpdateRowsDTO::class, $event);
+        self::assertSame([[
+            'before' => ['id' => 1, 'a' => null, 'b' => null, 'c' => null],
+            'after' => ['id' => null, 'a' => 11, 'b' => 'new', 'c' => null],
+        ]], $event->values);
+    }
+
     public function testShouldGetWriteEventDropTable(): void
     {
         // exercises the information_schema fallback's "table no longer exists" guard, so force it
@@ -145,10 +244,11 @@ class BasicTest extends BaseCase
         /** @var WriteRowsDTO $event */
         $event = $this->getEvent();
         self::assertInstanceOf(WriteRowsDTO::class, $event);
-        self::assertEquals([
+        // the dropped column is still decoded by its binlog type, so no phantom rows follow
+        self::assertSame([[
             'id' => 1,
-            'DROPPED_COLUMN_1' => null,
-        ], $event->values[0]);
+            'DROPPED_COLUMN_1' => 'A value',
+        ]], $event->values);
 
         $event = $this->getEvent();
         self::assertInstanceOf(WriteRowsDTO::class, $event);

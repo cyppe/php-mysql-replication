@@ -46,12 +46,30 @@ readonly class TableMapBuilder
         // binlog_row_metadata=MINIMAL still writes a metadata block (e.g. signedness) but
         // never a complete column-name list; only FULL emits COLUMN_NAME for every
         // column, so an empty or partial list cannot safely replace information_schema.
-        if ($tableMapMetadata !== null && count($tableMapMetadata->columnNames) === $columnsAmount) {
+        if ($tableMapMetadata !== null && $this->isComplete($tableMapMetadata, $rawColumnDTOs)) {
             $this->logger->debug('Resolving column metadata for ' . $schemaName . '.' . $tableName . ' from TABLE_MAP_EVENT metadata');
             $fieldDTOCollection = $this->makeFieldDTOCollectionFromMetadata($rawColumnDTOs, $tableMapMetadata);
+        } elseif ($this->config->requireTableMapMetadata) {
+            throw TableMapMetadataException::incomplete(
+                $schemaName,
+                $tableName,
+                $tableId,
+                $columnsAmount,
+                $tableMapMetadata === null ? 0 : count($tableMapMetadata->columnNames),
+                $eventInfo->binLogCurrent->getBinFileName(),
+                $eventInfo->pos
+            );
         } else {
             $this->logger->debug('Resolving column metadata for ' . $schemaName . '.' . $tableName . ' from information_schema');
             $fieldDTOCollection = $this->repository->getFields($schemaName, $tableName);
+            if (!$fieldDTOCollection->isEmpty() && $fieldDTOCollection->count() !== $columnsAmount) {
+                $this->logger->warning(
+                    'information_schema lists ' . $fieldDTOCollection->count() . ' columns for ' . $schemaName . '.' . $tableName
+                    . ' but the TABLE_MAP_EVENT (table_id ' . $tableId . ') has ' . $columnsAmount
+                    . '; the table changed after this event was written, so column names may be misattributed.'
+                    . ' Use binlog_row_metadata=FULL with useTableMapMetadata to decode by the event\'s own names.'
+                );
+            }
         }
 
         $columnDTOCollection = $this->makeColumnDTOCollection($rawColumnDTOs, $fieldDTOCollection);
@@ -98,6 +116,31 @@ readonly class TableMapBuilder
             $metadataLength,
             array_map(static fn (ColumnDTO $columnDTO): int => $columnDTO->type, $rawColumnDTOs)
         );
+    }
+
+    /**
+     * Complete means the metadata can fully replace information_schema: a name for every
+     * column and the literal list of every ENUM/SET column (FULL writes all of them or,
+     * on a server-side failure, none of the optional fields).
+     *
+     * @param array<int, ColumnDTO> $rawColumnDTOs
+     */
+    private function isComplete(TableMapMetadata $tableMapMetadata, array $rawColumnDTOs): bool
+    {
+        if (count($tableMapMetadata->columnNames) !== count($rawColumnDTOs)) {
+            return false;
+        }
+
+        foreach ($rawColumnDTOs as $offset => $rawColumnDTO) {
+            if ($rawColumnDTO->type === ConstFieldType::ENUM && !isset($tableMapMetadata->enumValues[$offset])) {
+                return false;
+            }
+            if ($rawColumnDTO->type === ConstFieldType::SET && !isset($tableMapMetadata->setValues[$offset])) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /**
@@ -150,16 +193,16 @@ readonly class TableMapBuilder
         }
 
         foreach ($rawColumnDTOs as $offset => $rawColumnDTO) {
-            // this a dirty hack to prevent row events containing columns which have been dropped
-            // (only reachable via the information_schema fallback; the binlog metadata path is
-            // self-describing and always covers every column written into this very event)
-            if ($fieldDTOCollection->offsetExists($offset)) {
-                $fieldDTO = $fieldDTOCollection->offsetGet($offset);
-                $type = $rawColumnDTO->type;
-            } else {
-                $fieldDTO = FieldDTO::makeDummy($offset);
-                $type = ConstFieldType::IGNORE;
-            }
+            // a column written into this event but no longer in information_schema (dropped after
+            // the event was written; only reachable via the information_schema fallback, the binlog
+            // metadata path is self-describing) gets a placeholder name but is still decoded by its
+            // real binlog type: the type and its storage metadata always come from the event, and
+            // skipping it as IGNORE (0 bytes for fixed-width types) desynchronised every later
+            // value, e.g. a wrong primary key after dropping the last column
+            $fieldDTO = $fieldDTOCollection->offsetExists($offset)
+                ? $fieldDTOCollection->offsetGet($offset)
+                : FieldDTO::makeDummy($offset);
+            $type = $rawColumnDTO->type;
 
             if ($fieldDTO !== null) {
                 $columnDTOCollection->set(

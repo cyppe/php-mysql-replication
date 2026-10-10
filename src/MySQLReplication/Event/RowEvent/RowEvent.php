@@ -7,6 +7,7 @@ namespace MySQLReplication\Event\RowEvent;
 use DateTime;
 use Exception;
 use MySQLReplication\BinaryDataReader\BinaryDataReader;
+use MySQLReplication\BinaryDataReader\BinaryDataReaderException;
 use MySQLReplication\BinLog\BinLogServerInfo;
 use MySQLReplication\Config\Config;
 use MySQLReplication\Definitions\ConstEventType;
@@ -23,6 +24,7 @@ use MySQLReplication\Repository\RepositoryInterface;
 use Psr\Log\LoggerInterface;
 use Psr\SimpleCache\CacheInterface;
 use RuntimeException;
+use WeakMap;
 
 class RowEvent extends EventCommon
 {
@@ -292,6 +294,16 @@ class RowEvent extends EventCommon
 
     private ?TableMap $currentTableMap;
 
+    /**
+     * @var WeakMap<TableMap, array{0: list<array{0: int, 1: string, 2: int, 3: bool, 4: ColumnDTO}>, 1: string}>|null
+     */
+    private static ?WeakMap $columnPlans = null;
+
+    /**
+     * @var array<string, int> columns-present bitmap => number of present columns, per event
+     */
+    private array $presentCounts = [];
+
     private readonly TableMapCache $tableMapCache;
 
     private readonly TableMapBuilder $tableMapBuilder;
@@ -342,8 +354,9 @@ class RowEvent extends EventCommon
         $data['columns_amount'] = (int)$this->binaryDataReader->readCodedBinary();
         $data['column_types'] = $this->binaryDataReader->read($data['columns_amount']);
 
-        if ($this->tableMapCache->has($data['table_id'])) {
-            return new TableMapDTO($this->eventInfo, $this->tableMapCache->get($data['table_id']));
+        $cachedTableMap = $this->tableMapCache->has($data['table_id']) ? $this->tableMapCache->get($data['table_id']) : null;
+        if ($cachedTableMap instanceof TableMap && !$this->config->requireTableMapMetadata) {
+            return new TableMapDTO($this->eventInfo, $cachedTableMap);
         }
 
         $this->binaryDataReader->readCodedBinary();
@@ -357,6 +370,15 @@ class RowEvent extends EventCommon
             $data['columns_amount'],
             $data['column_types']
         );
+
+        // Require mode builds every TABLE_MAP_EVENT, cached or not, so the builder checks its own metadata: a table first
+        // mapped under FULL cannot pass a later MINIMAL map. A map that passes and equals the cached one leaves the cache
+        // as it was, so no other table's map is evicted before its rows arrive and the cached map keeps its decoding plan.
+        // A map that differs (another source sharing the static cache under the same table id) replaces the cached one.
+        // The maps are compared serialized, which is strict and includes private state: loose == takes column "01" for "1".
+        if ($cachedTableMap instanceof TableMap && serialize($cachedTableMap) === serialize($tableMap)) {
+            return new TableMapDTO($this->eventInfo, $cachedTableMap);
+        }
 
         $this->tableMapCache->set($data['table_id'], $tableMap);
 
@@ -389,24 +411,35 @@ class RowEvent extends EventCommon
 
     public function makeUpdateRowsDTO(): ?UpdateRowsDTO
     {
-        $this->currentTableMap = $this->findTableMap();
-        if ($this->currentTableMap === null) {
+        $tableMap = $this->currentTableMap = $this->findTableMap();
+        if ($tableMap === null) {
             return null;
         }
 
-        $columnsBinarySize = $this->getColumnsBinarySize($this->currentTableMap->columnsAmount);
+        // same guard as getValues(): without columns we cannot decode the row images
+        if ($tableMap->columnDTOCollection->isEmpty()) {
+            return new UpdateRowsDTO($this->eventInfo, $tableMap, 0, []);
+        }
+
+        $columnsBinarySize = $this->getColumnsBinarySize($tableMap->columnsAmount);
         $beforeBinaryData = $this->binaryDataReader->read($columnsBinarySize);
         $afterBinaryData = $this->binaryDataReader->read($columnsBinarySize);
 
+        $trailerLength = $this->getTrailerLength();
         $values = [];
-        while (!$this->binaryDataReader->isComplete($this->eventInfo->getSizeNoHeader())) {
-            $values[] = [
-                'before' => $this->getColumnData($beforeBinaryData),
-                'after' => $this->getColumnData($afterBinaryData),
-            ];
+        try {
+            while ($this->binaryDataReader->getBinaryDataLength() > $trailerLength) {
+                $values[] = [
+                    'before' => $this->getColumnData($beforeBinaryData),
+                    'after' => $this->getColumnData($afterBinaryData),
+                ];
+            }
+        } catch (BinaryDataReaderException $exception) {
+            throw RowEventDesyncException::make($tableMap, $this->eventInfo, -1, $exception);
         }
+        $this->assertRowsEndAtEventBoundary($trailerLength);
 
-        return new UpdateRowsDTO($this->eventInfo, $this->currentTableMap, count($values), $values);
+        return new UpdateRowsDTO($this->eventInfo, $tableMap, count($values), $values);
     }
 
     protected function findTableMap(): ?TableMap
@@ -423,7 +456,12 @@ class RowEvent extends EventCommon
             ],
             true
         )) {
-            $this->binaryDataReader->read((int)($this->binaryDataReader->readUInt16() / 8));
+            // v2 extra data: a 2-byte length that counts itself, then extra-row-info such as the
+            // partition id MySQL 8.0.16+ writes for partitioned tables (and NDB info). Skip it whole.
+            $extraDataLength = $this->binaryDataReader->readUInt16();
+            if ($extraDataLength > 2) {
+                $this->binaryDataReader->advance($extraDataLength - 2);
+            }
         }
 
         $this->binaryDataReader->readCodedBinary();
@@ -440,18 +478,47 @@ class RowEvent extends EventCommon
     protected function getValues(): array
     {
         // if we don't get columns from information schema we don't know how to assign them
-        if ($this->currentTableMap === null || $this->currentTableMap->columnDTOCollection->isEmpty()) {
+        $tableMap = $this->currentTableMap;
+        if ($tableMap === null || $tableMap->columnDTOCollection->isEmpty()) {
             return [];
         }
 
-        $binaryData = $this->binaryDataReader->read($this->getColumnsBinarySize($this->currentTableMap->columnsAmount));
+        $binaryData = $this->binaryDataReader->read($this->getColumnsBinarySize($tableMap->columnsAmount));
 
+        $trailerLength = $this->getTrailerLength();
         $values = [];
-        while (!$this->binaryDataReader->isComplete($this->eventInfo->getSizeNoHeader())) {
-            $values[] = $this->getColumnData($binaryData);
+        try {
+            while ($this->binaryDataReader->getBinaryDataLength() > $trailerLength) {
+                $values[] = $this->getColumnData($binaryData);
+            }
+        } catch (BinaryDataReaderException $exception) {
+            throw RowEventDesyncException::make($tableMap, $this->eventInfo, -1, $exception);
         }
+        $this->assertRowsEndAtEventBoundary($trailerLength);
 
         return $values;
+    }
+
+    /**
+     * Rows run to the end of the packet minus the trailing checksum. Measuring the bytes left in
+     * the packet (instead of bytes read against the header's event size) stays correct when a
+     * semi-sync prefix precedes the event header.
+     */
+    protected function getTrailerLength(): int
+    {
+        return $this->eventInfo->checkSum ? 4 : 0;
+    }
+
+    /**
+     * A correct decode consumes the row images exactly. Ending anywhere else means the column
+     * metadata does not describe the written rows, and every value (keys included) is suspect.
+     */
+    protected function assertRowsEndAtEventBoundary(int $trailerLength): void
+    {
+        $unreadBytes = $this->binaryDataReader->getBinaryDataLength() - $trailerLength;
+        if ($unreadBytes !== 0 && $this->currentTableMap !== null) {
+            throw RowEventDesyncException::make($this->currentTableMap, $this->eventInfo, $unreadBytes);
+        }
     }
 
     protected function getColumnsBinarySize(int $columnsAmount): int
@@ -479,32 +546,34 @@ class RowEvent extends EventCommon
             throw new RuntimeException('Current table map is missing!');
         }
 
+        [$columns, $fullBitmap] = $this->getColumnPlan($this->currentTableMap);
+        // a full row image (every column present) skips the per-column presence test
+        $allPresent = $colsBitmap === $fullBitmap;
+        $presentCount = $allPresent ? count($columns) : ($this->presentCounts[$colsBitmap] ??= $this->bitCount($colsBitmap));
+
         $values = [];
 
         // null bitmap length = (bits set in 'columns-present-bitmap'+7)/8
         // see http://dev.mysql.com/doc/internals/en/rows-event.html
-        $nullBitmap = $this->binaryDataReader->read($this->getColumnsBinarySize($this->bitCount($colsBitmap)));
+        $nullBitmap = $this->binaryDataReader->read($this->getColumnsBinarySize($presentCount));
         $nullBitmapIndex = 0;
 
-        foreach ($this->currentTableMap->columnDTOCollection as $i => $columnDTO) {
-            $name = $columnDTO->getName();
-            $type = $columnDTO->type;
-
-            if ($this->bitGet($colsBitmap, $i) === 0) {
+        foreach ($columns as [$i, $name, $type, $unsigned, $columnDTO]) {
+            if (!$allPresent && (ord($colsBitmap[$i >> 3]) & (1 << ($i & 7))) === 0) {
                 $values[$name] = null;
                 continue;
             }
 
-            if ($this->isNull($nullBitmap, $nullBitmapIndex)) {
+            if ((ord($nullBitmap[$nullBitmapIndex >> 3]) & (1 << ($nullBitmapIndex & 7))) !== 0) {
                 $values[$name] = null;
             } else {
                 $values[$name] = match ($type) {
                     ConstFieldType::IGNORE => $this->getIgnore($columnDTO),
-                    ConstFieldType::TINY => $columnDTO->isUnsigned() ? $this->binaryDataReader->readUInt8() : $this->binaryDataReader->readInt8(),
-                    ConstFieldType::SHORT => $columnDTO->isUnsigned() ? $this->binaryDataReader->readUInt16() : $this->binaryDataReader->readInt16(),
-                    ConstFieldType::LONG => $columnDTO->isUnsigned() ? $this->binaryDataReader->readUInt32() : $this->binaryDataReader->readInt32(),
-                    ConstFieldType::LONGLONG => $columnDTO->isUnsigned() ? $this->binaryDataReader->readUInt64() : $this->binaryDataReader->readInt64(),
-                    ConstFieldType::INT24 => $columnDTO->isUnsigned() ? $this->binaryDataReader->readUInt24() : $this->binaryDataReader->readInt24(),
+                    ConstFieldType::TINY => $unsigned ? $this->binaryDataReader->readUInt8() : $this->binaryDataReader->readInt8(),
+                    ConstFieldType::SHORT => $unsigned ? $this->binaryDataReader->readUInt16() : $this->binaryDataReader->readInt16(),
+                    ConstFieldType::LONG => $unsigned ? $this->binaryDataReader->readUInt32() : $this->binaryDataReader->readInt32(),
+                    ConstFieldType::LONGLONG => $unsigned ? $this->binaryDataReader->readUInt64() : $this->binaryDataReader->readInt64(),
+                    ConstFieldType::INT24 => $unsigned ? $this->binaryDataReader->readUInt24() : $this->binaryDataReader->readInt24(),
                     // http://dev.mysql.com/doc/refman/5.7/en/floating-point-types.html FLOAT(7,4)
                     ConstFieldType::FLOAT => round($this->binaryDataReader->readFloat(), 4),
                     ConstFieldType::DOUBLE => $this->binaryDataReader->readDouble(),
@@ -536,6 +605,35 @@ class RowEvent extends EventCommon
         }
 
         return $values;
+    }
+
+    /**
+     * Per-table decode plan, built once per TableMap instead of once per column per row: the
+     * column offset, name, type, unsigned flag and DTO as a plain list, plus the columns-present
+     * bitmap of a full row image.
+     *
+     * @return array{0: list<array{0: int, 1: string, 2: int, 3: bool, 4: ColumnDTO}>, 1: string}
+     */
+    protected function getColumnPlan(TableMap $tableMap): array
+    {
+        self::$columnPlans ??= new WeakMap();
+
+        if (isset(self::$columnPlans[$tableMap])) {
+            return self::$columnPlans[$tableMap];
+        }
+
+        $columns = [];
+        foreach ($tableMap->columnDTOCollection as $i => $columnDTO) {
+            $columns[] = [$i, $columnDTO->getName(), $columnDTO->type, $columnDTO->isUnsigned(), $columnDTO];
+        }
+
+        $columnsAmount = $tableMap->columnsAmount;
+        $fullBitmap = str_repeat("\xFF", intdiv($columnsAmount, 8));
+        if ($columnsAmount % 8 !== 0) {
+            $fullBitmap .= chr((1 << ($columnsAmount % 8)) - 1);
+        }
+
+        return self::$columnPlans[$tableMap] = [$columns, $fullBitmap];
     }
 
     protected function bitCount(string $bitmap): int
@@ -727,30 +825,42 @@ class RowEvent extends EventCommon
     }
 
     /**
-     * TIME encoding for non-fractional part:
-     * 1 bit sign    (1= non-negative, 0= negative)
-     * 1 bit unused  (reserved for future extensions)
-     * 10 bits hour   (0-838)
-     * 6 bits minute (0-59)
-     * 6 bits second (0-59)
-     * ---------------------
-     * 24 bits = 3 bytes
+     * TIME2 (MySQL 5.6.4+), my_time_packed_from_binary() in mysys/my_time.cc: a big-endian
+     * integer part offset by 0x800000 (1 bit sign, 1 unused, 10 bits hour, 6 bits minute,
+     * 6 bits second), then 0-3 bytes of fraction whose sign follows the integer part.
+     * Hours run to 838 and values can be negative, so this must not go through DateTime.
      */
     protected function getTime2(ColumnDTO $columnDTO): string
     {
-        $data = $this->binaryDataReader->readInt24Be();
+        $intPart = $this->readUInt24Be() - 0x800000;
+        $fsp = $columnDTO->fsp;
 
-        $hour = $this->binaryDataReader->getBinarySlice($data, 2, 10, 24);
-        $minute = $this->binaryDataReader->getBinarySlice($data, 12, 6, 24);
-        $second = $this->binaryDataReader->getBinarySlice($data, 18, 6, 24);
-
-        $time = (new DateTime())->setTime($hour, $minute, $second)->format('H:i:s');
-        $fsp = $this->getFSP($columnDTO);
-        if ($fsp !== '') {
-            $time .= '.' . $fsp;
+        if ($fsp === 1 || $fsp === 2) {
+            $frac = $this->binaryDataReader->readUInt8();
+            if ($intPart < 0 && $frac !== 0) {
+                ++$intPart;
+                $frac -= 0x100;
+            }
+            $packed = $intPart * 0x1000000 + $frac * 10000;
+        } elseif ($fsp === 3 || $fsp === 4) {
+            $frac = $this->readUInt16Be();
+            if ($intPart < 0 && $frac !== 0) {
+                ++$intPart;
+                $frac -= 0x10000;
+            }
+            $packed = $intPart * 0x1000000 + $frac * 100;
+        } elseif ($fsp === 5 || $fsp === 6) {
+            $packed = ($intPart + 0x800000) * 0x1000000 + $this->readUInt24Be() - 0x800000000000;
+        } else {
+            $packed = $intPart * 0x1000000;
         }
 
-        return $time;
+        $sign = $packed < 0 ? '-' : '';
+        $packed = abs($packed);
+        $hms = $packed >> 24;
+        $time = sprintf('%s%02d:%02d:%02d', $sign, ($hms >> 12) & 0x3FF, ($hms >> 6) & 0x3F, $hms & 0x3F);
+
+        return $fsp > 0 ? $time . '.' . sprintf('%06d', $packed % 0x1000000) : $time;
     }
 
     protected function getTimestamp2(ColumnDTO $columnDTO): string
@@ -758,10 +868,25 @@ class RowEvent extends EventCommon
         $datetime = date('Y-m-d H:i:s', $this->binaryDataReader->readInt32Be());
         $fsp = $this->getFSP($columnDTO);
         if ($fsp !== '') {
-            $datetime .= '.' . $fsp;
+            // getFSP() returns microseconds without leading zeros (.012 -> "12000")
+            $datetime .= '.' . str_pad($fsp, 6, '0', STR_PAD_LEFT);
         }
 
         return $datetime;
+    }
+
+    private function readUInt24Be(): int
+    {
+        $bytes = $this->binaryDataReader->read(3);
+
+        return (ord($bytes[0]) << 16) | (ord($bytes[1]) << 8) | ord($bytes[2]);
+    }
+
+    private function readUInt16Be(): int
+    {
+        $bytes = $this->binaryDataReader->read(2);
+
+        return (ord($bytes[0]) << 8) | ord($bytes[1]);
     }
 
     protected function getDate(): ?string
