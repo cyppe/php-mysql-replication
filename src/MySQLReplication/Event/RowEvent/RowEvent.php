@@ -354,7 +354,9 @@ class RowEvent extends EventCommon
         $data['columns_amount'] = (int)$this->binaryDataReader->readCodedBinary();
         $data['column_types'] = $this->binaryDataReader->read($data['columns_amount']);
 
-        if ($this->tableMapCache->has($data['table_id'])) {
+        // Require mode checks every TABLE_MAP_EVENT's own metadata, so a table first mapped under FULL cannot pass a
+        // later MINIMAL map from the cache.
+        if (!$this->config->requireTableMapMetadata && $this->tableMapCache->has($data['table_id'])) {
             return new TableMapDTO($this->eventInfo, $this->tableMapCache->get($data['table_id']));
         }
 

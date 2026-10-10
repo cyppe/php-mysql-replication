@@ -10,6 +10,7 @@ use MySQLReplication\Event\DTO\FormatDescriptionEventDTO;
 use MySQLReplication\Event\DTO\QueryDTO;
 use MySQLReplication\Event\DTO\RotateDTO;
 use MySQLReplication\Event\DTO\WriteRowsDTO;
+use MySQLReplication\Event\DTO\XidDTO;
 use MySQLReplication\Event\RowEvent\TableMapMetadataException;
 
 class TableMapMetadataTest extends BaseCase
@@ -90,6 +91,27 @@ class TableMapMetadataTest extends BaseCase
         }
 
         self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+
+        $this->expectException(TableMapMetadataException::class);
+        $this->expectExceptionMessage('TABLE_MAP_EVENT for mysqlreplication_test.test');
+        $this->getEvent();
+    }
+
+    public function testRequiredMetadataChecksATableMapItHasCachedAlready(): void
+    {
+        $this->reconnectRequiringMetadata();
+
+        self::assertInstanceOf(WriteRowsDTO::class, $this->createAndInsertValue(self::CREATE_QUERY, self::INSERT_QUERY));
+
+        $this->connection->executeStatement('SET GLOBAL binlog_row_metadata = MINIMAL');
+        try {
+            $this->connection->executeStatement('INSERT INTO test VALUES (43, "open", "b", "again")');
+        } finally {
+            $this->connection->executeStatement('SET GLOBAL binlog_row_metadata = FULL');
+        }
+
+        self::assertInstanceOf(XidDTO::class, $this->getEvent());
         self::assertInstanceOf(QueryDTO::class, $this->getEvent());
 
         $this->expectException(TableMapMetadataException::class);
