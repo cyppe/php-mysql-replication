@@ -33,6 +33,12 @@ class Socket implements SocketInterface
 
     public function readFromSocket(int $length): string
     {
+        // a packet continuation of exactly 0 bytes ends a payload of a multiple of 16 MiB - 1;
+        // socket_recv() leaves the buffer null for it, which is not a string
+        if ($length === 0) {
+            return '';
+        }
+
         $received = socket_recv($this->socket, $buf, $length, MSG_WAITALL);
         if ($length === $received) {
             return $buf;
