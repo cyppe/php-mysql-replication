@@ -9,6 +9,7 @@ namespace MySQLReplication\Tests\Integration;
 use MySQLReplication\Event\DTO\FormatDescriptionEventDTO;
 use MySQLReplication\Event\DTO\QueryDTO;
 use MySQLReplication\Event\DTO\RotateDTO;
+use MySQLReplication\Event\DTO\TableMapDTO;
 use MySQLReplication\Event\DTO\WriteRowsDTO;
 use MySQLReplication\Event\DTO\XidDTO;
 use MySQLReplication\Event\RowEvent\TableMapMetadataException;
@@ -117,6 +118,24 @@ class TableMapMetadataTest extends BaseCase
         $this->expectException(TableMapMetadataException::class);
         $this->expectExceptionMessage('TABLE_MAP_EVENT for mysqlreplication_test.test');
         $this->getEvent();
+    }
+
+    public function testRequiredMetadataKeepsTheCachedMapOfATableThatPassesAgain(): void
+    {
+        $this->reconnectRequiringMetadata();
+
+        $first = $this->createAndInsertValue(self::CREATE_QUERY, self::INSERT_QUERY);
+        self::assertInstanceOf(WriteRowsDTO::class, $first);
+
+        $this->connection->executeStatement('INSERT INTO test VALUES (43, "open", "b", "again")');
+
+        self::assertInstanceOf(XidDTO::class, $this->getEvent());
+        self::assertInstanceOf(QueryDTO::class, $this->getEvent());
+        $tableMapEvent = $this->getEvent();
+        self::assertInstanceOf(TableMapDTO::class, $tableMapEvent);
+
+        // The second map was checked and passed; the cache still holds the first map, so nothing was re-set or evicted.
+        self::assertSame($first->tableMap, $tableMapEvent->tableMap);
     }
 
     private function reconnectRequiringMetadata(): void

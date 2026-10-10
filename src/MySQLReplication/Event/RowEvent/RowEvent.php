@@ -354,10 +354,9 @@ class RowEvent extends EventCommon
         $data['columns_amount'] = (int)$this->binaryDataReader->readCodedBinary();
         $data['column_types'] = $this->binaryDataReader->read($data['columns_amount']);
 
-        // Require mode checks every TABLE_MAP_EVENT's own metadata, so a table first mapped under FULL cannot pass a
-        // later MINIMAL map from the cache.
-        if (!$this->config->requireTableMapMetadata && $this->tableMapCache->has($data['table_id'])) {
-            return new TableMapDTO($this->eventInfo, $this->tableMapCache->get($data['table_id']));
+        $cachedTableMap = $this->tableMapCache->has($data['table_id']) ? $this->tableMapCache->get($data['table_id']) : null;
+        if ($cachedTableMap instanceof TableMap && !$this->config->requireTableMapMetadata) {
+            return new TableMapDTO($this->eventInfo, $cachedTableMap);
         }
 
         $this->binaryDataReader->readCodedBinary();
@@ -371,6 +370,13 @@ class RowEvent extends EventCommon
             $data['columns_amount'],
             $data['column_types']
         );
+
+        // Require mode builds every TABLE_MAP_EVENT, cached or not, so the builder checks its own metadata: a table first
+        // mapped under FULL cannot pass a later MINIMAL map. A map that passes leaves the cache as it was, so no other
+        // table's map is evicted before its rows arrive and the cached map keeps its decoding plan.
+        if ($cachedTableMap instanceof TableMap) {
+            return new TableMapDTO($this->eventInfo, $cachedTableMap);
+        }
 
         $this->tableMapCache->set($data['table_id'], $tableMap);
 
