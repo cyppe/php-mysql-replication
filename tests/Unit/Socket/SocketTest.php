@@ -193,6 +193,88 @@ class SocketTest extends TestCase
         self::assertTrue($interrupted);
     }
 
+    public function testShouldNotLetARecurringSignalHoldASilentReadOpen(): void
+    {
+        // A handler that returns, called every 0.1 s for 3 s: each interrupt used to start a whole new timeout,
+        // so the read only failed once the signals stopped.
+        pcntl_signal(SIGUSR1, static function (): void {
+        }, false);
+        $port = $this->spawnPeer('for ($i = 0; $i < 30; $i++) { usleep(100000); posix_kill(' . getmypid() . ', SIGUSR1); } usleep(300000);');
+        $socket = new Socket(0.5);
+        $socket->connectToStream('127.0.0.1', $port);
+
+        $started = hrtime(true);
+        $exception = $this->readExpectingFailure($socket, 4);
+        $elapsed = (hrtime(true) - $started) / 1e9;
+
+        self::assertSame(SocketException::SOCKET_READ_TIMEOUT_CODE, $exception->getCode());
+        self::assertSame('No data from the replication source for 0.5 s (read 0 of 4 bytes).', $exception->getMessage());
+        self::assertGreaterThanOrEqual(0.45, $elapsed);
+        self::assertLessThan(1.2, $elapsed);
+    }
+
+    public function testShouldNotLetARecurringSignalHoldAStalledWriteOpen(): void
+    {
+        pcntl_signal(SIGUSR1, static function (): void {
+        }, false);
+        // The peer never reads, so the send buffer fills and stays full while the signals keep coming.
+        $port = $this->spawnPeer('for ($i = 0; $i < 40; $i++) { usleep(100000); posix_kill(' . getmypid() . ', SIGUSR1); } usleep(300000);');
+        $socket = new Socket(0.5);
+        $socket->connectToStream('127.0.0.1', $port);
+
+        $started = hrtime(true);
+        try {
+            $socket->writeToSocket(str_repeat('x', 64 * 1024 * 1024));
+            self::fail('Expected a SocketException.');
+        } catch (SocketException $exception) {
+            self::assertSame(SocketException::SOCKET_WRITE_TIMEOUT_CODE, $exception->getCode());
+        }
+        $elapsed = (hrtime(true) - $started) / 1e9;
+
+        self::assertLessThan(2.0, $elapsed);
+    }
+
+    public function testShouldCountTheIdleTimeFromTheLastByteOnceAPacketIsPartlyRead(): void
+    {
+        // "ab" at once, "c" at 1.3 s, then silence. The first call returns "ab" when its 1 s timeout ends; the rest
+        // is read call by call, so the read fails 1 s after "c" arrived (about 2.3 s), not a whole timeout after
+        // the call that brought "c" started (about 3 s).
+        $port = $this->spawnPeer('fwrite($c, "ab"); usleep(1300000); fwrite($c, "c"); usleep(3000000);');
+        $socket = new Socket(1.0);
+        $socket->connectToStream('127.0.0.1', $port);
+
+        $started = hrtime(true);
+        $exception = $this->readExpectingFailure($socket, 4);
+        $elapsed = (hrtime(true) - $started) / 1e9;
+
+        self::assertSame('No data from the replication source for 1 s (read 3 of 4 bytes).', $exception->getMessage());
+        self::assertGreaterThanOrEqual(2.1, $elapsed);
+        self::assertLessThan(2.7, $elapsed);
+    }
+
+    public function testShouldReadTheEmptyPacketThatEndsAMaximumLengthPayload(): void
+    {
+        // A payload of exactly 16,777,215 bytes is followed by a packet header of length 0; the caller then reads
+        // zero bytes, which must not touch the socket or fail.
+        $port = $this->spawnPeer('fwrite($c, "\xff\xff\xff\x01"); $left = 16777215; while ($left > 0) { $left -= fwrite($c, str_repeat("y", min($left, 1048576))); } fwrite($c, "\x00\x00\x00\x02"); usleep(500000);');
+        $socket = new Socket(2.0);
+        $socket->connectToStream('127.0.0.1', $port);
+
+        self::assertSame("\xff\xff\xff\x01", $socket->readFromSocket(4));
+        self::assertSame(16777215, strlen($socket->readFromSocket(16777215)));
+        self::assertSame("\x00\x00\x00\x02", $socket->readFromSocket(4));
+        self::assertSame('', $socket->readFromSocket(0));
+    }
+
+    public function testShouldReturnAnEmptyStringForAZeroLengthReadWithoutATimeout(): void
+    {
+        $port = $this->listen();
+        $socket = new Socket();
+        $socket->connectToStream('127.0.0.1', $port);
+
+        self::assertSame('', $socket->readFromSocket(0));
+    }
+
     public function testShouldApplyTheTimeoutToEachReadSoAQuietButLiveStreamKeepsReading(): void
     {
         // A heartbeat-like peer: 4 bytes every 0.3 s for 6 rounds (about 1.8 s in total), well past

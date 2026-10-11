@@ -26,7 +26,8 @@ class Socket implements SocketInterface
      *                              per heartbeat period, so a timeout of several periods turns a silently
      *                              dropped connection into a SocketException. A read fails after one timeout
      *                              without any new byte; a packet already partly received gets at most one
-     *                              more timeout before it fails.
+     *                              more timeout before it fails (so at most two timeouts after its last byte).
+     *                              Signals that interrupt a call do not extend the timeout.
      */
     public function __construct(float $timeoutSeconds = 0.0)
     {
@@ -60,11 +61,8 @@ class Socket implements SocketInterface
 
         if ($this->timeoutSeconds > 0.0) {
             // SO_RCVTIMEO bounds each blocking recv; SO_SNDTIMEO bounds each write and, on Linux, the blocking connect.
-            $timeval = $this->timeval();
-            if (!socket_set_option($this->socket, SOL_SOCKET, SO_RCVTIMEO, $timeval)
-                || !socket_set_option($this->socket, SOL_SOCKET, SO_SNDTIMEO, $timeval)) {
-                throw new SocketException(SocketException::SOCKET_UNABLE_TO_SET_TIMEOUT_MESSAGE . $this->getSocketErrorMessage(), SocketException::SOCKET_UNABLE_TO_SET_TIMEOUT_CODE);
-            }
+            $this->setTimeout(SO_RCVTIMEO, $this->timeoutSeconds);
+            $this->setTimeout(SO_SNDTIMEO, $this->timeoutSeconds);
         }
 
         // Failures are reported as a SocketException, which callers treat as retryable. Without the silence
@@ -82,28 +80,43 @@ class Socket implements SocketInterface
 
     public function readFromSocket(int $length): string
     {
+        // A payload of exactly 16,777,215 bytes (or a multiple) ends with an empty packet. socket_recv() refuses a
+        // zero length with false and no error code, which used to surface as SocketException("Success", 0) and a
+        // replay of the same event on every reconnect.
+        if ($length === 0) {
+            return '';
+        }
+
+        $started = hrtime(true);
         $received = @socket_recv($this->socket, $buf, $length, MSG_WAITALL);
         if ($length === $received) {
             return $buf;
         }
 
-        return $this->readRemainder($length, $received, is_int($received) && $received > 0 ? $buf : '');
+        $progressed = is_int($received) && $received > 0;
+
+        // Bytes may have arrived at any point of the first call, so the idle time counts from now; a call that
+        // brought nothing (a signal) counts from its start.
+        return $this->readRemainder($length, $received, $progressed ? $buf : '', $progressed ? hrtime(true) : $started);
     }
 
     public function writeToSocket(string $data): void
     {
         $length = strlen($data);
         $written = 0;
+        $idleSince = hrtime(true);
+        $shortened = false;
 
         while ($written < $length) {
             $sent = @socket_write($this->socket, $written === 0 ? $data : substr($data, $written), $length - $written);
 
             if ($sent === false) {
                 $code = $this->getSocketErrorCode();
-                if ($code === SOCKET_EINTR) {
+                if ($code === SOCKET_EINTR && $this->shortenTimeoutAfterInterrupt(SO_SNDTIMEO, $idleSince)) {
+                    $shortened = $shortened || $this->timeoutSeconds > 0.0;
                     continue;
                 }
-                if ($this->isTimeout($code)) {
+                if ($code === SOCKET_EINTR || $this->isTimeout($code)) {
                     throw new SocketException(sprintf(SocketException::SOCKET_WRITE_TIMEOUT_MESSAGE, $written, $length, $this->timeoutSeconds), SocketException::SOCKET_WRITE_TIMEOUT_CODE);
                 }
 
@@ -115,6 +128,11 @@ class Socket implements SocketInterface
             }
 
             $written += $sent;
+            $idleSince = hrtime(true);
+            if ($shortened) {
+                $this->setTimeout(SO_SNDTIMEO, $this->timeoutSeconds);
+                $shortened = false;
+            }
         }
     }
 
@@ -124,8 +142,10 @@ class Socket implements SocketInterface
      * next bytes, so a packet that keeps arriving, however slowly, is read whole, and a connection that stops
      * delivering fails within one timeout.
      */
-    private function readRemainder(int $length, int|false $received, string $data): string
+    private function readRemainder(int $length, int|false $received, string $data, int|float $idleSince): string
     {
+        $shortened = false;
+
         while (true) {
             if ($received === 0) {
                 // http://php.net/manual/en/function.socket-recv.php#47182
@@ -134,13 +154,15 @@ class Socket implements SocketInterface
 
             if ($received === false) {
                 $code = $this->getSocketErrorCode();
-                if ($code !== SOCKET_EINTR) {
-                    if ($this->isTimeout($code)) {
+                $interrupted = $code === SOCKET_EINTR;
+                if (!$interrupted || !$this->shortenTimeoutAfterInterrupt(SO_RCVTIMEO, $idleSince)) {
+                    if ($interrupted || $this->isTimeout($code)) {
                         throw new SocketException(sprintf(SocketException::SOCKET_READ_TIMEOUT_MESSAGE, $this->timeoutSeconds, strlen($data), $length), SocketException::SOCKET_READ_TIMEOUT_CODE);
                     }
 
                     throw new SocketException($this->getSocketErrorMessage(), $code);
                 }
+                $shortened = $shortened || $this->timeoutSeconds > 0.0;
             }
 
             if (strlen($data) === $length) {
@@ -152,7 +174,46 @@ class Socket implements SocketInterface
             $received = @socket_recv($this->socket, $chunk, $length - strlen($data), 0);
             if (is_int($received) && $received > 0) {
                 $data .= $chunk;
+                $idleSince = hrtime(true);
+                if ($shortened) {
+                    $this->setTimeout(SO_RCVTIMEO, $this->timeoutSeconds);
+                    $shortened = false;
+                }
             }
+        }
+    }
+
+    /**
+     * A signal interrupts a timed call with EINTR, and the next call would start a whole new timeout, so a
+     * handled signal that keeps recurring could hold a dead connection open forever. After an interrupt the
+     * next call gets only what is left of the timeout since the last progress.
+     *
+     * @param int|float $idleSince hrtime(true) at the last progress
+     *
+     * @return bool false when the timeout since the last progress has run out
+     */
+    private function shortenTimeoutAfterInterrupt(int $option, int|float $idleSince): bool
+    {
+        if ($this->timeoutSeconds <= 0.0) {
+            return true;
+        }
+
+        $remaining = $this->timeoutSeconds - (hrtime(true) - $idleSince) / 1e9;
+        if ($remaining <= 0.0) {
+            return false;
+        }
+
+        $this->setTimeout($option, $remaining);
+
+        return true;
+    }
+
+    private function setTimeout(int $option, float $seconds): void
+    {
+        // Silenced like the calls below: a refused option must reach the caller as code 1004, not as a warning
+        // that a framework error handler turns into an ErrorException.
+        if (!@socket_set_option($this->socket, SOL_SOCKET, $option, $this->timeval($seconds))) {
+            throw new SocketException(SocketException::SOCKET_UNABLE_TO_SET_TIMEOUT_MESSAGE . $this->getSocketErrorMessage(), SocketException::SOCKET_UNABLE_TO_SET_TIMEOUT_CODE);
         }
     }
 
@@ -164,10 +225,10 @@ class Socket implements SocketInterface
     /**
      * @return array{sec: int, usec: int}
      */
-    private function timeval(): array
+    private function timeval(float $timeoutSeconds): array
     {
-        $seconds = (int)floor($this->timeoutSeconds);
-        $microseconds = (int)round(($this->timeoutSeconds - $seconds) * 1_000_000);
+        $seconds = (int)floor($timeoutSeconds);
+        $microseconds = (int)round(($timeoutSeconds - $seconds) * 1_000_000);
 
         if ($microseconds >= 1_000_000) {
             ++$seconds;
