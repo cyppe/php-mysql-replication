@@ -10,6 +10,7 @@ use ErrorException;
 use InvalidArgumentException;
 use MySQLReplication\Socket\Socket;
 use MySQLReplication\Socket\SocketException;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use RuntimeException;
 
@@ -19,7 +20,7 @@ use RuntimeException;
  */
 class SocketTest extends TestCase
 {
-    private const GUARD_SECONDS = 5;
+    private const GUARD_SECONDS = 8;
 
     /** @var resource|null */
     private $server;
@@ -30,6 +31,9 @@ class SocketTest extends TestCase
     /** @var resource|null */
     private $process;
 
+    /** @var array<int, resource> */
+    private array $pipes = [];
+
     protected function setUp(): void
     {
         if (!function_exists('pcntl_alarm')) {
@@ -38,7 +42,7 @@ class SocketTest extends TestCase
 
         pcntl_async_signals(true);
         pcntl_signal(SIGALRM, static function (): void {
-            throw new RuntimeException('Guard alarm: the read blocked past ' . self::GUARD_SECONDS . ' s.');
+            throw new RuntimeException('Guard alarm: the call blocked past ' . self::GUARD_SECONDS . ' s.');
         }, false);
         pcntl_alarm(self::GUARD_SECONDS);
     }
@@ -47,12 +51,18 @@ class SocketTest extends TestCase
     {
         pcntl_alarm(0);
         pcntl_signal(SIGALRM, SIG_DFL);
+        pcntl_signal(SIGUSR1, SIG_DFL);
 
         if (is_resource($this->peer)) {
             fclose($this->peer);
         }
         if (is_resource($this->server)) {
             fclose($this->server);
+        }
+        foreach ($this->pipes as $pipe) {
+            if (is_resource($pipe)) {
+                fclose($pipe);
+            }
         }
         if (is_resource($this->process)) {
             proc_terminate($this->process);
@@ -73,11 +83,12 @@ class SocketTest extends TestCase
         $elapsed = (hrtime(true) - $started) / 1e9;
 
         self::assertSame(SocketException::SOCKET_READ_TIMEOUT_CODE, $exception->getCode());
+        self::assertSame('No data from the replication source for 0.5 s (read 0 of 4 bytes).', $exception->getMessage());
         self::assertGreaterThanOrEqual(0.45, $elapsed);
-        self::assertLessThan(2.0, $elapsed);
+        self::assertLessThan(1.5, $elapsed);
     }
 
-    public function testShouldFailAPartialPacketWithinTheReadTimeout(): void
+    public function testShouldFailAPacketThatStopsPartWayWithinTwoTimeouts(): void
     {
         $port = $this->listen();
         $socket = new Socket(0.5);
@@ -89,9 +100,33 @@ class SocketTest extends TestCase
         $exception = $this->readExpectingFailure($socket, 4);
         $elapsed = (hrtime(true) - $started) / 1e9;
 
-        self::assertSame(SocketException::SOCKET_PARTIAL_READ_CODE, $exception->getCode());
-        self::assertSame('Read 2 of 4 bytes before the read stopped.', $exception->getMessage());
+        self::assertSame(SocketException::SOCKET_READ_TIMEOUT_CODE, $exception->getCode());
+        self::assertSame('No data from the replication source for 0.5 s (read 2 of 4 bytes).', $exception->getMessage());
         self::assertLessThan(2.0, $elapsed);
+    }
+
+    public function testShouldReadAPacketThatKeepsArrivingForLongerThanTheTimeout(): void
+    {
+        // 12 bytes, one every 0.2 s: about 2.4 s for the packet, never 0.5 s without progress.
+        $port = $this->spawnPeer('for ($i = 0; $i < 12; $i++) { fwrite($c, chr(65 + $i)); usleep(200000); } usleep(300000);');
+        $socket = new Socket(0.5);
+        $socket->connectToStream('127.0.0.1', $port);
+
+        self::assertSame('ABCDEFGHIJKL', $socket->readFromSocket(12));
+    }
+
+    public function testShouldReportAPeerThatClosesAfterPartOfAPacketAsADisconnect(): void
+    {
+        $port = $this->listen();
+        $socket = new Socket(5.0);
+        $socket->connectToStream('127.0.0.1', $port);
+        $this->peer = $this->accept();
+        fwrite($this->peer, 'ab');
+        fclose($this->peer);
+
+        $exception = $this->readExpectingFailure($socket, 4);
+
+        self::assertSame(SocketException::SOCKET_DISCONNECTED_CODE, $exception->getCode());
     }
 
     public function testShouldReportACleanDisconnectAtOnce(): void
@@ -143,6 +178,21 @@ class SocketTest extends TestCase
         }
     }
 
+    public function testShouldResumeAReadInterruptedByASignal(): void
+    {
+        // A signal whose handler returns (unlike SIGTERM's exit) must not cost the connection.
+        $interrupted = false;
+        pcntl_signal(SIGUSR1, static function () use (&$interrupted): void {
+            $interrupted = true;
+        }, false);
+        $port = $this->spawnPeer('usleep(300000); posix_kill(' . getmypid() . ', SIGUSR1); usleep(300000); fwrite($c, "data"); usleep(300000);');
+        $socket = new Socket(2.0);
+        $socket->connectToStream('127.0.0.1', $port);
+
+        self::assertSame('data', $socket->readFromSocket(4));
+        self::assertTrue($interrupted);
+    }
+
     public function testShouldApplyTheTimeoutToEachReadSoAQuietButLiveStreamKeepsReading(): void
     {
         // A heartbeat-like peer: 4 bytes every 0.3 s for 6 rounds (about 1.8 s in total), well past
@@ -165,11 +215,66 @@ class SocketTest extends TestCase
         self::assertSame('abcd', $socket->readFromSocket(4));
     }
 
-    public function testShouldRejectANegativeTimeout(): void
+    public function testShouldWriteEveryByteOfALargeCommandToASlowReader(): void
+    {
+        // 16 MiB drained at 256 KiB per 50 ms takes about 3 s, more than the socket buffers hold and far past
+        // the 0.5 s timeout, so a send returns a short count after each timeout and the rest must be resumed.
+        $port = $this->spawnPeer('$n = 0; while ($n < 16777216) { $d = stream_socket_recvfrom($c, 262144); if ($d === false || $d === "") { break; } $n += strlen($d); usleep(50000); } echo $n, "\n";');
+        $socket = new Socket(0.5);
+        $socket->connectToStream('127.0.0.1', $port);
+
+        $socket->writeToSocket(str_repeat('x', 16777216));
+
+        self::assertSame('16777216', trim((string)fgets($this->pipes[1])));
+    }
+
+    public function testShouldFailAWriteThatMakesNoProgressWithinTheTimeout(): void
+    {
+        // The peer never reads, so the send buffer fills and stays full.
+        $port = $this->listen();
+        $socket = new Socket(0.5);
+        $socket->connectToStream('127.0.0.1', $port);
+        $this->peer = $this->accept();
+
+        try {
+            $socket->writeToSocket(str_repeat('x', 64 * 1024 * 1024));
+            self::fail('Expected a SocketException.');
+        } catch (SocketException $exception) {
+            self::assertSame(SocketException::SOCKET_WRITE_TIMEOUT_CODE, $exception->getCode());
+            self::assertMatchesRegularExpression('/^Wrote \d+ of 67108864 bytes before the write timeout of 0.5 s\.$/', $exception->getMessage());
+        }
+    }
+
+    /**
+     * @return iterable<string, array{0: float}>
+     */
+    public static function invalidTimeouts(): iterable
+    {
+        yield 'negative' => [-1.0];
+        yield 'not a number' => [NAN];
+        yield 'infinite' => [INF];
+        yield 'beyond a timeval' => [3e9];
+    }
+
+    #[DataProvider('invalidTimeouts')]
+    public function testShouldRejectAnInvalidTimeout(float $timeout): void
     {
         $this->expectException(InvalidArgumentException::class);
 
-        new Socket(-1.0);
+        new Socket($timeout);
+    }
+
+    public function testShouldKeepNoTimeoutForASubclassThatDoesNotCallTheParentConstructor(): void
+    {
+        $port = $this->spawnPeer('fwrite($c, "data"); usleep(300000);');
+        $socket = new class() extends Socket {
+            public function __construct()
+            {
+            }
+        };
+        $socket->connectToStream('127.0.0.1', $port);
+
+        self::assertSame('data', $socket->readFromSocket(4));
     }
 
     private function readExpectingFailure(Socket $socket, int $length): SocketException
@@ -189,7 +294,10 @@ class SocketTest extends TestCase
         self::assertNotFalse($server, $error);
         $this->server = $server;
 
-        return $this->portOf($server);
+        $name = stream_socket_get_name($server, false);
+        self::assertNotFalse($name);
+
+        return (int)substr($name, strrpos($name, ':') + 1);
     }
 
     /**
@@ -205,7 +313,7 @@ class SocketTest extends TestCase
     }
 
     /**
-     * Runs a one-connection peer in a child PHP process, so it can write while this process blocks in a read.
+     * Runs a one-connection peer in a child PHP process, so it can read or write while this process blocks.
      * The child prints its port, accepts one connection as $c, runs $body, then exits.
      */
     private function spawnPeer(string $body): int
@@ -215,21 +323,11 @@ class SocketTest extends TestCase
         $process = proc_open([PHP_BINARY, '-r', $script], [1 => ['pipe', 'w']], $pipes);
         self::assertIsResource($process);
         $this->process = $process;
+        $this->pipes = $pipes;
 
         $port = (int)fgets($pipes[1]);
         self::assertGreaterThan(0, $port);
 
         return $port;
-    }
-
-    /**
-     * @param resource $server
-     */
-    private function portOf($server): int
-    {
-        $name = stream_socket_get_name($server, false);
-        self::assertNotFalse($name);
-
-        return (int)substr($name, strrpos($name, ':') + 1);
     }
 }
