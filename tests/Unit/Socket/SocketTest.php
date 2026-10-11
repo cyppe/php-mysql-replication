@@ -234,6 +234,21 @@ class SocketTest extends TestCase
         self::assertLessThan(2.0, $elapsed);
     }
 
+    public function testShouldRestoreTheFullTimeoutWhenTheSocketIsUsedAgainAfterAnInterruptedTimeout(): void
+    {
+        // Signals every 0.1 s until 1.2 s and data at 1.5 s, timeout 1 s. The first read times out at about 1 s with
+        // the receive timeout shortened by the last interrupt; the next read on the same socket must wait the full
+        // second again and get the data, not fail within the leftover fraction.
+        pcntl_signal(SIGUSR1, static function (): void {
+        }, false);
+        $port = $this->spawnPeer('for ($i = 0; $i < 12; $i++) { usleep(100000); posix_kill(' . getmypid() . ', SIGUSR1); } usleep(300000); fwrite($c, "data"); usleep(500000);');
+        $socket = new Socket(1.0);
+        $socket->connectToStream('127.0.0.1', $port);
+
+        self::assertSame(SocketException::SOCKET_READ_TIMEOUT_CODE, $this->readExpectingFailure($socket, 4)->getCode());
+        self::assertSame('data', $socket->readFromSocket(4));
+    }
+
     public function testShouldCountTheIdleTimeFromTheLastByteOnceAPacketIsPartlyRead(): void
     {
         // "ab" at once, "c" at 1.3 s, then silence. The first call returns "ab" when its 1 s timeout ends; the rest

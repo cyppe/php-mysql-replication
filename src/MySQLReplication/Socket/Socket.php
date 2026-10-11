@@ -20,6 +20,12 @@ class Socket implements SocketInterface
      */
     private float $timeoutSeconds = 0.0;
 
+    /** Whether a signal left SO_RCVTIMEO shorter than the configured timeout; restored before the next wait. */
+    private bool $receiveTimeoutShortened = false;
+
+    /** The same for SO_SNDTIMEO. */
+    private bool $sendTimeoutShortened = false;
+
     /**
      * @param float $timeoutSeconds How long connect, a read or a write may wait without any progress; 0 waits
      *                              forever. A replication source sends an event or a heartbeat at least once
@@ -87,6 +93,9 @@ class Socket implements SocketInterface
             return '';
         }
 
+        // A read that failed after a signal may have left a shortened timeout behind.
+        $this->restoreTimeout(SO_RCVTIMEO);
+
         $started = hrtime(true);
         $received = @socket_recv($this->socket, $buf, $length, MSG_WAITALL);
         if ($length === $received) {
@@ -104,8 +113,8 @@ class Socket implements SocketInterface
     {
         $length = strlen($data);
         $written = 0;
+        $this->restoreTimeout(SO_SNDTIMEO);
         $idleSince = hrtime(true);
-        $shortened = false;
 
         while ($written < $length) {
             $sent = @socket_write($this->socket, $written === 0 ? $data : substr($data, $written), $length - $written);
@@ -113,7 +122,6 @@ class Socket implements SocketInterface
             if ($sent === false) {
                 $code = $this->getSocketErrorCode();
                 if ($code === SOCKET_EINTR && $this->shortenTimeoutAfterInterrupt(SO_SNDTIMEO, $idleSince)) {
-                    $shortened = $shortened || $this->timeoutSeconds > 0.0;
                     continue;
                 }
                 if ($code === SOCKET_EINTR || $this->isTimeout($code)) {
@@ -129,10 +137,7 @@ class Socket implements SocketInterface
 
             $written += $sent;
             $idleSince = hrtime(true);
-            if ($shortened) {
-                $this->setTimeout(SO_SNDTIMEO, $this->timeoutSeconds);
-                $shortened = false;
-            }
+            $this->restoreTimeout(SO_SNDTIMEO);
         }
     }
 
@@ -144,8 +149,6 @@ class Socket implements SocketInterface
      */
     private function readRemainder(int $length, int|false $received, string $data, int|float $idleSince): string
     {
-        $shortened = false;
-
         while (true) {
             if ($received === 0) {
                 // http://php.net/manual/en/function.socket-recv.php#47182
@@ -162,7 +165,6 @@ class Socket implements SocketInterface
 
                     throw new SocketException($this->getSocketErrorMessage(), $code);
                 }
-                $shortened = $shortened || $this->timeoutSeconds > 0.0;
             }
 
             if (strlen($data) === $length) {
@@ -175,10 +177,7 @@ class Socket implements SocketInterface
             if (is_int($received) && $received > 0) {
                 $data .= $chunk;
                 $idleSince = hrtime(true);
-                if ($shortened) {
-                    $this->setTimeout(SO_RCVTIMEO, $this->timeoutSeconds);
-                    $shortened = false;
-                }
+                $this->restoreTimeout(SO_RCVTIMEO);
             }
         }
     }
@@ -204,8 +203,30 @@ class Socket implements SocketInterface
         }
 
         $this->setTimeout($option, $remaining);
+        if ($option === SO_RCVTIMEO) {
+            $this->receiveTimeoutShortened = true;
+        } else {
+            $this->sendTimeoutShortened = true;
+        }
 
         return true;
+    }
+
+    /**
+     * Puts back the configured timeout after progress, or before the next call when a failed one left it short.
+     */
+    private function restoreTimeout(int $option): void
+    {
+        if ($option === SO_RCVTIMEO ? !$this->receiveTimeoutShortened : !$this->sendTimeoutShortened) {
+            return;
+        }
+
+        $this->setTimeout($option, $this->timeoutSeconds);
+        if ($option === SO_RCVTIMEO) {
+            $this->receiveTimeoutShortened = false;
+        } else {
+            $this->sendTimeoutShortened = false;
+        }
     }
 
     private function setTimeout(int $option, float $seconds): void
